@@ -170,6 +170,21 @@ impl ErasureCoder {
         Ok(result)
     }
 
+    /// Encode parity shards in-place from pre-split data + parity shard buffers.
+    ///
+    /// `shards` must contain exactly `data_shards + parity_shards` elements.
+    /// The first `data_shards` elements contain the data; the remaining parity
+    /// elements will be overwritten with computed parity data.
+    pub fn encode_shards(&self, shards: &mut [Vec<u8>]) -> Result<()> {
+        if shards.len() != self.total_shards() {
+            return Err(ErasureError::InvalidShardSize);
+        }
+        self.rs
+            .encode(shards)
+            .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Verify that enough shards are present for reconstruction
     pub fn verify(&self, shards: &[Option<Vec<u8>>]) -> bool {
         let present = shards.iter().filter(|s| s.is_some()).count();
