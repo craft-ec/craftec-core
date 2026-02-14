@@ -1,0 +1,18 @@
+[package]
+name = "craftec-network"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+craftec-core = { workspace = true }
+craftec-crypto = { workspace = true }
+libp2p = { workspace = true }
+libp2p-stream = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
