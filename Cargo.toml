@@ -11,6 +11,7 @@ members = [
     "crates/network",
     "crates/ipc",
     "crates/identity",
+    "crates/settlement",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ craftec-app = { path = "crates/app" }
 craftec-network = { path = "crates/network" }
 craftec-ipc = { path = "crates/ipc" }
 craftec-identity = { path = "crates/identity" }
+craftec-settlement = { path = "crates/settlement" }
 
 # Async
 tokio = { version = "1.35", features = ["full"] }

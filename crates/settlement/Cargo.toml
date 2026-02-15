@@ -1,0 +1,17 @@
+[package]
+name = "craftec-settlement"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Client-side types and instruction builders for the Craftec settlement Solana program"
+
+[dependencies]
+craftec-core = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+bincode = "1"
+
+[dev-dependencies]
+serde_json = { workspace = true }
