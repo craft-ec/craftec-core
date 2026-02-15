@@ -1,0 +1,24 @@
+[package]
+name = "craftec-aggregator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Aggregator service: collects StorageReceipts, batches per epoch, generates ZK proofs, posts distributions on-chain"
+
+[dependencies]
+craftec-core = { workspace = true }
+craftec-settlement = { workspace = true }
+craftec-prover = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bincode = "1"
+hex = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
