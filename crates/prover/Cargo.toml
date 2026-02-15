@@ -6,6 +6,11 @@ authors.workspace = true
 license.workspace = true
 description = "Host-side ZK prover for Craftec distribution proofs"
 
+[features]
+default = ["mock"]
+mock = []
+sp1 = ["dep:sp1-sdk", "dep:sp1-build"]
+
 [dependencies]
 craftec-prover-guest-types = { path = "../prover-guest-types" }
 craftec-core = { path = "../core" }
@@ -13,6 +18,12 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 
+# SP1 dependencies (optional)
+sp1-sdk = { version = "5.2", optional = true }
+
 [dev-dependencies]
 rand = { workspace = true }
 ed25519-dalek = { workspace = true }
+
+[build-dependencies]
+sp1-build = { version = "5.2", optional = true }

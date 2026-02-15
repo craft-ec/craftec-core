@@ -1,8 +1,10 @@
 //! Host-side ZK prover for Craftec distribution proofs.
 //!
-//! Currently implements a mock prover that executes the same logic as the
-//! SP1 guest program without generating a real ZK proof. This is sufficient
-//! for testing and development while the SP1 toolchain is not installed.
+//! Two modes:
+//! - **mock** (default feature): Executes guest logic locally without ZK proof.
+//!   Sufficient for testing and development.
+//! - **sp1** feature: Uses SP1 SDK to execute the guest ELF in the zkVM and
+//!   generate real Groth16 proofs for on-chain verification.
 
 mod merkle;
 
@@ -10,13 +12,12 @@ use std::collections::BTreeMap;
 
 use craftec_core::ContributionReceipt;
 use craftec_prover_guest_types::{DistributionEntry, DistributionOutput, ReceiptData};
+#[cfg(feature = "sp1")]
+use craftec_prover_guest_types::DistributionInput;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use merkle::compute_merkle_root;
-
-/// Magic bytes identifying a mock proof (not a real Groth16 proof).
-const MOCK_PROOF_MAGIC: &[u8] = b"CRAFTEC_MOCK_PROOF_V1";
 
 #[derive(Debug, Error)]
 pub enum ProverError {
@@ -32,6 +33,8 @@ pub enum ProverError {
     InvalidProof,
     #[error("proof output mismatch")]
     OutputMismatch,
+    #[error("sp1 error: {0}")]
+    Sp1(String),
 }
 
 /// A batch proof containing proof bytes and public inputs.
@@ -43,10 +46,18 @@ pub struct BatchProof {
     pub public_inputs: Vec<u8>,
 }
 
+// ─── Mock prover ───────────────────────────────────────────────────
+
+/// Magic bytes identifying a mock proof (not a real Groth16 proof).
+#[cfg(feature = "mock")]
+const MOCK_PROOF_MAGIC: &[u8] = b"CRAFTEC_MOCK_PROOF_V1";
+
 /// Mock prover client that executes distribution logic without SP1.
+#[cfg(feature = "mock")]
 #[derive(Default)]
 pub struct ProverClient;
 
+#[cfg(feature = "mock")]
 impl ProverClient {
     pub fn new() -> Self {
         Self
@@ -159,6 +170,153 @@ impl ProverClient {
         })
     }
 }
+
+// ─── SP1 prover ────────────────────────────────────────────────────
+
+#[cfg(feature = "sp1")]
+use sp1_sdk::include_elf;
+
+/// The compiled SP1 guest ELF, embedded at build time.
+#[cfg(feature = "sp1")]
+const DISTRIBUTION_ELF: &[u8] = include_elf!("craftec-distribution-guest");
+
+/// SP1 prover client that generates real ZK proofs.
+#[cfg(feature = "sp1")]
+pub struct ProverClient {
+    client: sp1_sdk::EnvProver,
+}
+
+#[cfg(feature = "sp1")]
+impl Default for ProverClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "sp1")]
+impl ProverClient {
+    pub fn new() -> Self {
+        Self {
+            client: sp1_sdk::ProverClient::from_env(),
+        }
+    }
+
+    /// Prove a batch of contribution receipts using SP1 zkVM.
+    ///
+    /// Generates a Groth16 proof suitable for on-chain verification.
+    pub fn prove_batch<R: ContributionReceipt>(
+        &self,
+        receipts: &[R],
+        pool_id: &[u8; 32],
+    ) -> Result<BatchProof, ProverError> {
+        if receipts.is_empty() {
+            return Err(ProverError::EmptyBatch);
+        }
+
+        let receipt_data: Vec<ReceiptData> = receipts
+            .iter()
+            .map(|r| ReceiptData {
+                operator: r.operator(),
+                signer: r.signer(),
+                weight: r.weight(),
+                timestamp: r.timestamp(),
+                signable_data: r.signable_data(),
+                signature: r.signature().to_vec(),
+            })
+            .collect();
+
+        let input = DistributionInput {
+            pool_id: *pool_id,
+            receipts: receipt_data,
+        };
+
+        let mut stdin = sp1_sdk::SP1Stdin::new();
+        stdin.write(&input);
+
+        let (pk, _vk) = self.client.setup(DISTRIBUTION_ELF);
+
+        let proof = self.client
+            .prove(&pk, &stdin)
+            .groth16()
+            .run()
+            .map_err(|e| ProverError::Sp1(e.to_string()))?;
+
+        let public_inputs = proof.public_values.as_slice().to_vec();
+        let proof_bytes = proof.bytes();
+
+        Ok(BatchProof {
+            proof_bytes,
+            public_inputs,
+        })
+    }
+
+    /// Execute the guest program without generating a proof (for testing/dry-run).
+    pub fn execute_batch<R: ContributionReceipt>(
+        &self,
+        receipts: &[R],
+        pool_id: &[u8; 32],
+    ) -> Result<DistributionOutput, ProverError> {
+        if receipts.is_empty() {
+            return Err(ProverError::EmptyBatch);
+        }
+
+        let receipt_data: Vec<ReceiptData> = receipts
+            .iter()
+            .map(|r| ReceiptData {
+                operator: r.operator(),
+                signer: r.signer(),
+                weight: r.weight(),
+                timestamp: r.timestamp(),
+                signable_data: r.signable_data(),
+                signature: r.signature().to_vec(),
+            })
+            .collect();
+
+        let input = DistributionInput {
+            pool_id: *pool_id,
+            receipts: receipt_data,
+        };
+
+        let mut stdin = sp1_sdk::SP1Stdin::new();
+        stdin.write(&input);
+
+        let (output, _report) = self.client
+            .execute(DISTRIBUTION_ELF, &stdin)
+            .run()
+            .map_err(|e| ProverError::Sp1(e.to_string()))?;
+
+        let output_bytes: [u8; 76] = output
+            .as_slice()
+            .try_into()
+            .map_err(|_| ProverError::Sp1("unexpected output length".into()))?;
+
+        Ok(DistributionOutput::from_bytes(&output_bytes))
+    }
+
+    /// Verify a batch proof using SP1 SDK.
+    pub fn verify_batch(&self, proof: &BatchProof) -> Result<DistributionOutput, ProverError> {
+        // For Groth16, verification is typically done on-chain.
+        // Host-side we can parse the public values.
+        if proof.public_inputs.len() != 76 {
+            return Err(ProverError::InvalidProof);
+        }
+        let output_bytes: [u8; 76] = proof
+            .public_inputs
+            .as_slice()
+            .try_into()
+            .map_err(|_| ProverError::InvalidProof)?;
+        Ok(DistributionOutput::from_bytes(&output_bytes))
+    }
+
+    /// Get the verification key hash for the distribution guest program.
+    pub fn vkey_hash(&self) -> String {
+        use sp1_sdk::HashableKey;
+        let (_pk, vk) = self.client.setup(DISTRIBUTION_ELF);
+        vk.bytes32()
+    }
+}
+
+// ─── Shared utilities ──────────────────────────────────────────────
 
 /// Compute distribution entries from receipts (useful for testing).
 pub fn compute_distribution_entries<R: ContributionReceipt>(

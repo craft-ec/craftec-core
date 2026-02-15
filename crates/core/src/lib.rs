@@ -81,6 +81,11 @@ pub trait ContributionReceipt {
     fn signer(&self) -> [u8; 32];
     /// Timestamp of the contribution.
     fn timestamp(&self) -> u64;
+    /// Ed25519 signature over signable_data, by signer.
+    /// Required for SP1 proof generation; returns empty slice by default.
+    fn signature(&self) -> &[u8] {
+        &[]
+    }
 }
 
 #[cfg(test)]
