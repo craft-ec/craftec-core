@@ -1,16 +1,27 @@
 //! Receipt collector: validates, deduplicates, and queues StorageReceipts by pool.
+//!
+//! Supports ingestion from gossipsub via a channel-based listener.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use craftec_settlement::StorageReceipt;
 use ed25519_dalek::{Signature, VerifyingKey};
-use tracing::{debug, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 use crate::AggregatorError;
 
+/// A receipt message received from gossipsub (bincode-serialized StorageReceipt).
+#[derive(Debug, Clone)]
+pub struct GossipReceiptMessage {
+    /// Raw bincode-serialized StorageReceipt.
+    pub data: Vec<u8>,
+}
+
 /// Collects and validates StorageReceipts, grouping them by creator pool.
 pub struct ReceiptCollector {
-    /// Receipts grouped by pool pubkey (as hex string for simplicity).
+    /// Receipts grouped by pool pubkey.
     pool_receipts: HashMap<[u8; 32], Vec<StorageReceipt>>,
     /// Dedup set: SHA256 hashes of already-seen receipts.
     seen: HashSet<[u8; 32]>,
@@ -21,6 +32,8 @@ pub struct ReceiptCollector {
     grace_secs: u64,
     /// CID → pool pubkey mapping.
     cid_to_pool: HashMap<[u8; 32], [u8; 32]>,
+    /// Optional persistence directory for crash recovery.
+    persist_dir: Option<PathBuf>,
 }
 
 impl ReceiptCollector {
@@ -33,7 +46,19 @@ impl ReceiptCollector {
             epoch_end,
             grace_secs,
             cid_to_pool: HashMap::new(),
+            persist_dir: None,
         }
+    }
+
+    /// Enable receipt persistence to disk for crash recovery.
+    pub fn with_persistence(mut self, dir: PathBuf) -> Self {
+        self.persist_dir = Some(dir);
+        self
+    }
+
+    /// Set the persistence directory.
+    pub fn set_persist_dir(&mut self, dir: PathBuf) {
+        self.persist_dir = Some(dir);
     }
 
     /// Register a CID → pool mapping.
@@ -54,6 +79,31 @@ impl ReceiptCollector {
     /// Take all receipts for a given pool, draining them from the collector.
     pub fn take_receipts(&mut self, pool: &[u8; 32]) -> Vec<StorageReceipt> {
         self.pool_receipts.remove(pool).unwrap_or_default()
+    }
+
+    /// Process a raw gossipsub message: deserialize and ingest.
+    pub fn process_gossip_message(&mut self, data: &[u8]) -> Result<(), AggregatorError> {
+        let receipt: StorageReceipt = bincode::deserialize(data)
+            .map_err(|e| AggregatorError::Serialization(e.to_string()))?;
+        self.ingest(receipt)
+    }
+
+    /// Drain all pending receipts from a channel receiver and ingest them.
+    /// Returns the number of successfully ingested receipts.
+    pub fn drain_channel(
+        &mut self,
+        rx: &mut mpsc::Receiver<GossipReceiptMessage>,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(msg) = rx.try_recv() {
+            match self.process_gossip_message(&msg.data) {
+                Ok(()) => count += 1,
+                Err(e) => {
+                    debug!(error = %e, "rejected gossip receipt");
+                }
+            }
+        }
+        count
     }
 
     /// Validate and ingest a receipt. Returns Ok(()) if accepted.
@@ -89,6 +139,13 @@ impl ReceiptCollector {
             .copied()
             .ok_or(AggregatorError::UnknownPool)?;
 
+        // 6. Persist to disk before accepting (crash recovery)
+        if let Some(ref dir) = self.persist_dir {
+            if let Err(e) = persist_receipt(dir, &pool, &receipt) {
+                warn!(error = %e, "failed to persist receipt, accepting anyway");
+            }
+        }
+
         // Accept
         self.seen.insert(dedup);
         self.pool_receipts.entry(pool).or_default().push(receipt);
@@ -104,6 +161,83 @@ impl ReceiptCollector {
         self.epoch_start = epoch_start;
         self.epoch_end = epoch_end;
     }
+
+    /// Load persisted receipts from disk for crash recovery.
+    /// Receipts are re-validated on load.
+    pub fn load_persisted(&mut self, epoch_dir: &Path) -> usize {
+        let mut count = 0;
+        let entries = match std::fs::read_dir(epoch_dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "receipts").unwrap_or(false) {
+                match std::fs::read(&path) {
+                    Ok(data) => {
+                        match bincode::deserialize::<Vec<StorageReceipt>>(&data) {
+                            Ok(receipts) => {
+                                for receipt in receipts {
+                                    // Skip validation on reload (already validated)
+                                    let dedup = receipt.dedup_hash();
+                                    if self.seen.contains(&dedup) {
+                                        continue;
+                                    }
+                                    if let Some(&pool) = self.cid_to_pool.get(&receipt.content_id) {
+                                        self.seen.insert(dedup);
+                                        self.pool_receipts.entry(pool).or_default().push(receipt);
+                                        count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(path = %path.display(), error = %e, "failed to deserialize persisted receipts");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "failed to read persisted receipts");
+                    }
+                }
+            }
+        }
+        if count > 0 {
+            info!(count, "loaded persisted receipts");
+        }
+        count
+    }
+}
+
+/// Persist a receipt to disk (append to pool file).
+fn persist_receipt(
+    dir: &Path,
+    pool: &[u8; 32],
+    receipt: &StorageReceipt,
+) -> Result<(), AggregatorError> {
+    std::fs::create_dir_all(dir).map_err(|e| AggregatorError::Serialization(e.to_string()))?;
+
+    let filename = format!("pool_{}.receipts.log", hex::encode(pool));
+    let path = dir.join(filename);
+
+    let data =
+        bincode::serialize(receipt).map_err(|e| AggregatorError::Serialization(e.to_string()))?;
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| AggregatorError::Serialization(e.to_string()))?;
+
+    // Write length-prefixed record
+    let len = data.len() as u32;
+    file.write_all(&len.to_le_bytes())
+        .map_err(|e| AggregatorError::Serialization(e.to_string()))?;
+    file.write_all(&data)
+        .map_err(|e| AggregatorError::Serialization(e.to_string()))?;
+
+    Ok(())
 }
 
 /// Verify the challenger's ed25519 signature on a StorageReceipt.
@@ -121,8 +255,7 @@ fn verify_receipt_signature(receipt: &StorageReceipt) -> Result<(), AggregatorEr
         .try_into()
         .map_err(|_| AggregatorError::InvalidSignature)?;
 
-    let signature =
-        Signature::from_bytes(&sig_bytes);
+    let signature = Signature::from_bytes(&sig_bytes);
 
     let signable = receipt.signable_bytes();
 

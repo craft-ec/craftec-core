@@ -19,6 +19,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bincode = "1"
 hex = { workspace = true }
+async-trait = "0.1"
 
 [dev-dependencies]
 rand = { workspace = true }
+tempfile = "3"
