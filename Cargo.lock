@@ -514,6 +514,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-prover"
+version = "0.1.0"
+dependencies = [
+ "craftec-core",
+ "craftec-prover-guest-types",
+ "ed25519-dalek",
+ "rand 0.8.5",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "craftec-prover-guest-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "craftec-settings"
 version = "0.1.0"
 dependencies = [

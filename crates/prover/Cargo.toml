@@ -1,0 +1,18 @@
+[package]
+name = "craftec-prover"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Host-side ZK prover for Craftec distribution proofs"
+
+[dependencies]
+craftec-prover-guest-types = { path = "../prover-guest-types" }
+craftec-core = { path = "../core" }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }

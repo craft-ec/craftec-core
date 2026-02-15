@@ -1,0 +1,10 @@
+[package]
+name = "craftec-prover-guest-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared no-std types for Craftec ZK prover guest programs"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
