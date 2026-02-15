@@ -99,7 +99,6 @@ fn test_distribution_weights_sum() {
     let proof = client.prove_batch(&receipts, &pool_id).unwrap();
     let output = client.verify_batch(&proof).unwrap();
 
-    // Expected total: sum of 100..109 = 1045
     let expected_total: u64 = (0..10).map(|i| 100 + i as u64).sum();
     assert_eq!(output.total_weight, expected_total);
 }
@@ -110,7 +109,7 @@ fn test_distribution_entries() {
     let entries = compute_distribution_entries(&receipts);
 
     assert_eq!(entries.len(), 5);
-    let total: u64 = entries.iter().map(|e| e.weight).sum();
+    let total: u64 = entries.iter().map(|(_, w)| w).sum();
     let expected: u64 = (0..10).map(|i| 100 + i as u64).sum();
     assert_eq!(total, expected);
 }

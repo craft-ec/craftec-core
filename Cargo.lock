@@ -2063,6 +2063,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-aggregator"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "craftec-core",
+ "craftec-prover",
+ "craftec-settlement",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "craftec-app"
 version = "0.1.0"
 dependencies = [

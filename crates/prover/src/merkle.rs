@@ -2,8 +2,8 @@ use sha2::{Digest, Sha256};
 
 /// Compute the Merkle root of a list of leaf hashes.
 ///
-/// Uses SHA-256 for internal nodes. Empty input returns all zeros.
-/// Single leaf returns that leaf's hash. Odd-length levels duplicate the last element.
+/// Pads to next power-of-2 with `[0u8; 32]`, then bottom-up `SHA256(left || right)`.
+/// Matches the guest program and TunnelCraft's Merkle tree algorithm.
 pub fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
         return [0u8; 32];
@@ -12,31 +12,30 @@ pub fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         return leaves[0];
     }
 
-    let mut current_level = leaves.to_vec();
+    // Pad to next power of 2
+    let n = leaves.len().next_power_of_two();
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(n);
+    nodes.extend_from_slice(leaves);
+    while nodes.len() < n {
+        nodes.push([0u8; 32]);
+    }
 
-    while current_level.len() > 1 {
-        let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
-
-        for chunk in current_level.chunks(2) {
-            let left = &chunk[0];
-            let right = if chunk.len() == 2 {
-                &chunk[1]
-            } else {
-                &chunk[0] // duplicate last element for odd count
-            };
+    // Bottom-up merge
+    while nodes.len() > 1 {
+        let mut next = Vec::with_capacity(nodes.len() / 2);
+        for i in (0..nodes.len()).step_by(2) {
             let mut hasher = Sha256::new();
-            hasher.update(left);
-            hasher.update(right);
+            hasher.update(nodes[i]);
+            hasher.update(nodes[i + 1]);
             let result = hasher.finalize();
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&result);
-            next_level.push(hash);
+            next.push(hash);
         }
-
-        current_level = next_level;
+        nodes = next;
     }
 
-    current_level[0]
+    nodes[0]
 }
 
 #[cfg(test)]
@@ -59,11 +58,43 @@ mod tests {
         let a = [1u8; 32];
         let b = [2u8; 32];
         let root = compute_merkle_root(&[a, b]);
-        // Manually compute expected
         let mut hasher = Sha256::new();
         hasher.update(a);
         hasher.update(b);
         let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn test_three_leaves_pads_to_four() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        let root = compute_merkle_root(&[a, b, c]);
+
+        // Manually: pad with [0;32], so leaves = [a, b, c, zero]
+        let zero = [0u8; 32];
+        let left = {
+            let mut h = Sha256::new();
+            h.update(a);
+            h.update(b);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        let right = {
+            let mut h = Sha256::new();
+            h.update(c);
+            h.update(zero);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(left);
+            h.update(right);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
         assert_eq!(root, expected);
     }
 

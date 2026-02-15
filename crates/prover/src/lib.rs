@@ -2,18 +2,17 @@
 //!
 //! Two modes:
 //! - **mock** (default feature): Executes guest logic locally without ZK proof.
-//!   Sufficient for testing and development.
-//! - **sp1** feature: Uses SP1 SDK to execute the guest ELF in the zkVM and
-//!   generate real Groth16 proofs for on-chain verification.
+//! - **sp1** feature: Uses SP1 SDK to generate real Groth16 proofs.
+//!
+//! Receipt signature verification is done off-chain by the host/aggregator.
+//! The guest only builds the Merkle tree from pre-aggregated entries.
 
 mod merkle;
 
 use std::collections::BTreeMap;
 
 use craftec_core::ContributionReceipt;
-use craftec_prover_guest_types::{DistributionEntry, DistributionOutput, ReceiptData};
-#[cfg(feature = "sp1")]
-use craftec_prover_guest_types::DistributionInput;
+use craftec_prover_guest_types::{DistributionInput, DistributionOutput};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -46,13 +45,71 @@ pub struct BatchProof {
     pub public_inputs: Vec<u8>,
 }
 
+/// Pre-aggregate receipts into sorted (operator, weight) entries.
+///
+/// Validates receipts (non-zero weight/timestamp/operator) and accumulates
+/// weight per operator. This runs on the host before passing to the guest.
+fn aggregate_receipts<R: ContributionReceipt>(
+    receipts: &[R],
+) -> Result<Vec<([u8; 32], u64)>, ProverError> {
+    if receipts.is_empty() {
+        return Err(ProverError::EmptyBatch);
+    }
+
+    let mut weights: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+
+    for r in receipts {
+        if r.weight() == 0 {
+            return Err(ProverError::ZeroWeight);
+        }
+        if r.timestamp() == 0 {
+            return Err(ProverError::ZeroTimestamp);
+        }
+        if r.operator() == [0u8; 32] {
+            return Err(ProverError::ZeroOperator);
+        }
+        *weights.entry(r.operator()).or_insert(0) += r.weight();
+    }
+
+    // BTreeMap is already sorted by key
+    Ok(weights.into_iter().collect())
+}
+
+/// Execute guest logic on the host (shared between mock prover and tests).
+fn execute_guest_logic(input: &DistributionInput) -> DistributionOutput {
+    let mut entries = input.entries.clone();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total_weight: u64 = entries.iter().map(|(_, w)| w).sum();
+
+    let leaf_hashes: Vec<[u8; 32]> = entries
+        .iter()
+        .map(|(pubkey, weight)| {
+            let mut hasher = Sha256::new();
+            hasher.update(pubkey);
+            hasher.update(weight.to_le_bytes());
+            let result = hasher.finalize();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&result);
+            hash
+        })
+        .collect();
+
+    let root = compute_merkle_root(&leaf_hashes);
+
+    DistributionOutput {
+        root,
+        total_weight,
+        entry_count: entries.len() as u32,
+        pool_id: input.pool_id,
+    }
+}
+
 // ─── Mock prover ───────────────────────────────────────────────────
 
-/// Magic bytes identifying a mock proof (not a real Groth16 proof).
 #[cfg(feature = "mock")]
 const MOCK_PROOF_MAGIC: &[u8] = b"CRAFTEC_MOCK_PROOF_V1";
 
-/// Mock prover client that executes distribution logic without SP1.
 #[cfg(feature = "mock")]
 #[derive(Default)]
 pub struct ProverClient;
@@ -64,28 +121,22 @@ impl ProverClient {
     }
 
     /// Prove a batch of contribution receipts, returning a mock proof.
+    ///
+    /// Receipts are validated and pre-aggregated on the host side.
+    /// The guest only sees (operator, weight) entries.
     pub fn prove_batch<R: ContributionReceipt>(
         &self,
         receipts: &[R],
         pool_id: &[u8; 32],
     ) -> Result<BatchProof, ProverError> {
-        if receipts.is_empty() {
-            return Err(ProverError::EmptyBatch);
-        }
+        let entries = aggregate_receipts(receipts)?;
 
-        let receipt_data: Vec<ReceiptData> = receipts
-            .iter()
-            .map(|r| ReceiptData {
-                operator: r.operator(),
-                signer: r.signer(),
-                weight: r.weight(),
-                timestamp: r.timestamp(),
-                signable_data: r.signable_data(),
-                signature: vec![0u8; 64], // Mock doesn't verify signatures
-            })
-            .collect();
+        let input = DistributionInput {
+            entries,
+            pool_id: *pool_id,
+        };
 
-        let output = self.execute_guest_logic(&receipt_data, pool_id)?;
+        let output = execute_guest_logic(&input);
         let output_bytes = output.to_bytes();
 
         let mut proof_bytes = Vec::new();
@@ -119,56 +170,6 @@ impl ProverClient {
             .map_err(|_| ProverError::InvalidProof)?;
         Ok(DistributionOutput::from_bytes(&output_bytes))
     }
-
-    /// Execute the same logic the SP1 guest would run, without ZK.
-    fn execute_guest_logic(
-        &self,
-        receipts: &[ReceiptData],
-        pool_id: &[u8; 32],
-    ) -> Result<DistributionOutput, ProverError> {
-        let mut weights: BTreeMap<[u8; 32], u64> = BTreeMap::new();
-
-        for receipt in receipts {
-            if receipt.weight == 0 {
-                return Err(ProverError::ZeroWeight);
-            }
-            if receipt.timestamp == 0 {
-                return Err(ProverError::ZeroTimestamp);
-            }
-            if receipt.operator == [0u8; 32] {
-                return Err(ProverError::ZeroOperator);
-            }
-            *weights.entry(receipt.operator).or_insert(0) += receipt.weight;
-        }
-
-        let entries: Vec<DistributionEntry> = weights
-            .into_iter()
-            .map(|(operator, weight)| DistributionEntry { operator, weight })
-            .collect(); // BTreeMap is already sorted
-
-        let leaf_hashes: Vec<[u8; 32]> = entries
-            .iter()
-            .map(|e| {
-                let mut hasher = Sha256::new();
-                hasher.update(e.operator);
-                hasher.update(e.weight.to_le_bytes());
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                hash
-            })
-            .collect();
-
-        let root = compute_merkle_root(&leaf_hashes);
-        let total_weight: u64 = entries.iter().map(|e| e.weight).sum();
-
-        Ok(DistributionOutput {
-            root,
-            total_weight,
-            entry_count: entries.len() as u32,
-            pool_id: *pool_id,
-        })
-    }
 }
 
 // ─── SP1 prover ────────────────────────────────────────────────────
@@ -176,11 +177,9 @@ impl ProverClient {
 #[cfg(feature = "sp1")]
 use sp1_sdk::include_elf;
 
-/// The compiled SP1 guest ELF, embedded at build time.
 #[cfg(feature = "sp1")]
 const DISTRIBUTION_ELF: &[u8] = include_elf!("craftec-distribution-guest");
 
-/// SP1 prover client that generates real ZK proofs.
 #[cfg(feature = "sp1")]
 pub struct ProverClient {
     client: sp1_sdk::EnvProver,
@@ -202,32 +201,16 @@ impl ProverClient {
     }
 
     /// Prove a batch of contribution receipts using SP1 zkVM.
-    ///
-    /// Generates a Groth16 proof suitable for on-chain verification.
     pub fn prove_batch<R: ContributionReceipt>(
         &self,
         receipts: &[R],
         pool_id: &[u8; 32],
     ) -> Result<BatchProof, ProverError> {
-        if receipts.is_empty() {
-            return Err(ProverError::EmptyBatch);
-        }
-
-        let receipt_data: Vec<ReceiptData> = receipts
-            .iter()
-            .map(|r| ReceiptData {
-                operator: r.operator(),
-                signer: r.signer(),
-                weight: r.weight(),
-                timestamp: r.timestamp(),
-                signable_data: r.signable_data(),
-                signature: r.signature().to_vec(),
-            })
-            .collect();
+        let entries = aggregate_receipts(receipts)?;
 
         let input = DistributionInput {
+            entries,
             pool_id: *pool_id,
-            receipts: receipt_data,
         };
 
         let mut stdin = sp1_sdk::SP1Stdin::new();
@@ -235,7 +218,8 @@ impl ProverClient {
 
         let (pk, _vk) = self.client.setup(DISTRIBUTION_ELF);
 
-        let proof = self.client
+        let proof = self
+            .client
             .prove(&pk, &stdin)
             .groth16()
             .run()
@@ -256,31 +240,18 @@ impl ProverClient {
         receipts: &[R],
         pool_id: &[u8; 32],
     ) -> Result<DistributionOutput, ProverError> {
-        if receipts.is_empty() {
-            return Err(ProverError::EmptyBatch);
-        }
-
-        let receipt_data: Vec<ReceiptData> = receipts
-            .iter()
-            .map(|r| ReceiptData {
-                operator: r.operator(),
-                signer: r.signer(),
-                weight: r.weight(),
-                timestamp: r.timestamp(),
-                signable_data: r.signable_data(),
-                signature: r.signature().to_vec(),
-            })
-            .collect();
+        let entries = aggregate_receipts(receipts)?;
 
         let input = DistributionInput {
+            entries,
             pool_id: *pool_id,
-            receipts: receipt_data,
         };
 
         let mut stdin = sp1_sdk::SP1Stdin::new();
         stdin.write(&input);
 
-        let (output, _report) = self.client
+        let (output, _report) = self
+            .client
             .execute(DISTRIBUTION_ELF, &stdin)
             .run()
             .map_err(|e| ProverError::Sp1(e.to_string()))?;
@@ -295,8 +266,6 @@ impl ProverClient {
 
     /// Verify a batch proof using SP1 SDK.
     pub fn verify_batch(&self, proof: &BatchProof) -> Result<DistributionOutput, ProverError> {
-        // For Groth16, verification is typically done on-chain.
-        // Host-side we can parse the public values.
         if proof.public_inputs.len() != 76 {
             return Err(ProverError::InvalidProof);
         }
@@ -321,15 +290,12 @@ impl ProverClient {
 /// Compute distribution entries from receipts (useful for testing).
 pub fn compute_distribution_entries<R: ContributionReceipt>(
     receipts: &[R],
-) -> Vec<DistributionEntry> {
+) -> Vec<([u8; 32], u64)> {
     let mut weights: BTreeMap<[u8; 32], u64> = BTreeMap::new();
     for r in receipts {
         *weights.entry(r.operator()).or_insert(0) += r.weight();
     }
-    weights
-        .into_iter()
-        .map(|(operator, weight)| DistributionEntry { operator, weight })
-        .collect()
+    weights.into_iter().collect()
 }
 
 #[cfg(test)]

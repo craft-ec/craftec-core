@@ -1,90 +1,58 @@
 //! SP1 guest program for Craftec distribution proof.
 //!
-//! Runs inside the SP1 RISC-V VM. Given a batch of contribution receipts:
-//! 1. Verifies ed25519 signature on each receipt
-//! 2. Validates fields (non-zero weight, timestamp, operator)
-//! 3. Accumulates weight per operator
-//! 4. Builds Merkle tree of (operator, weight) leaves (sorted by operator)
-//! 5. Commits DistributionOutput (76 bytes) as public values
-//!
-//! The Merkle tree construction matches `compute_merkle_root` in
-//! `crates/prover/src/merkle.rs`: odd-length levels duplicate the last element.
+//! Runs inside the SP1 RISC-V VM. Given pre-aggregated distribution entries:
+//! 1. Sorts entries by operator pubkey (deterministic ordering)
+//! 2. Builds Merkle tree: leaf = SHA256(operator_pubkey || weight_le)
+//! 3. Pads to next power-of-2 with [0u8; 32], bottom-up SHA256(left || right)
+//! 4. Commits 76 bytes: root(32) + total_weight(8) + entry_count(4) + pool_id(32)
 
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use craftec_prover_guest_types::DistributionInput;
 
-extern crate alloc;
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-
 pub fn main() {
     let input = sp1_zkvm::io::read::<DistributionInput>();
 
-    assert!(!input.receipts.is_empty(), "empty receipt batch");
+    assert!(!input.entries.is_empty(), "empty distribution");
 
-    // 1. Verify every receipt and accumulate weights per operator
-    let mut weights: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    // 1. Sort entries by operator pubkey for deterministic ordering
+    let mut entries = input.entries.clone();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for receipt in &input.receipts {
-        // Ed25519 signature verification (SP1 patches ed25519-dalek to use precompile)
-        let verifying_key = VerifyingKey::from_bytes(&receipt.signer)
-            .expect("invalid signer public key");
+    // 2. Compute total weight
+    let total_weight: u64 = entries.iter().map(|(_, w)| w).sum();
 
-        let sig_bytes: [u8; 64] = receipt
-            .signature
-            .as_slice()
-            .try_into()
-            .expect("signature must be 64 bytes");
-        let signature = Signature::from_bytes(&sig_bytes);
-
-        use ed25519_dalek::Verifier;
-        verifying_key
-            .verify(&receipt.signable_data, &signature)
-            .expect("invalid ed25519 signature");
-
-        // Field validation
-        assert!(receipt.weight > 0, "zero weight");
-        assert!(receipt.timestamp > 0, "zero timestamp");
-        assert!(receipt.operator != [0u8; 32], "zero operator");
-
-        // Accumulate weight per operator
-        *weights.entry(receipt.operator).or_insert(0) += receipt.weight;
-    }
-
-    // 2. Build sorted leaves (BTreeMap is already sorted by key)
-    let leaf_hashes: Vec<[u8; 32]> = weights
+    // 3. Build Merkle tree
+    let leaves: Vec<[u8; 32]> = entries
         .iter()
-        .map(|(operator, weight)| {
-            let mut hasher = Sha256::new();
-            hasher.update(operator);
-            hasher.update(weight.to_le_bytes());
-            let result = hasher.finalize();
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&result);
-            hash
-        })
+        .map(|(pubkey, weight)| merkle_leaf(pubkey, *weight))
         .collect();
 
-    // 3. Compute Merkle root (matching host-side compute_merkle_root)
-    let root = compute_merkle_root(&leaf_hashes);
-    let total_weight: u64 = weights.values().sum();
-    let entry_count = weights.len() as u32;
+    let root = merkle_root(&leaves);
 
-    // 4. Commit output (76 bytes): root(32) + total_weight(8) + entry_count(4) + pool_id(32)
+    // 4. Commit output fields individually for predictable byte layout
     sp1_zkvm::io::commit_slice(&root);
     sp1_zkvm::io::commit_slice(&total_weight.to_le_bytes());
-    sp1_zkvm::io::commit_slice(&entry_count.to_le_bytes());
+    sp1_zkvm::io::commit_slice(&(entries.len() as u32).to_le_bytes());
     sp1_zkvm::io::commit_slice(&input.pool_id);
 }
 
-/// Compute Merkle root matching `crates/prover/src/merkle.rs`.
-/// Odd-length levels duplicate the last element.
-fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+/// Compute a leaf hash: SHA256(operator_pubkey || weight.to_le_bytes())
+fn merkle_leaf(pubkey: &[u8; 32], weight: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(pubkey);
+    hasher.update(weight.to_le_bytes());
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Build Merkle root: pad to next power-of-2 with [0u8; 32], bottom-up SHA256(left || right).
+fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
         return [0u8; 32];
     }
@@ -92,29 +60,28 @@ fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         return leaves[0];
     }
 
-    let mut current_level = leaves.to_vec();
-
-    while current_level.len() > 1 {
-        let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
-
-        for chunk in current_level.chunks(2) {
-            let left = &chunk[0];
-            let right = if chunk.len() == 2 {
-                &chunk[1]
-            } else {
-                &chunk[0] // duplicate last for odd count
-            };
-            let mut hasher = Sha256::new();
-            hasher.update(left);
-            hasher.update(right);
-            let result = hasher.finalize();
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&result);
-            next_level.push(hash);
-        }
-
-        current_level = next_level;
+    // Pad to next power of 2
+    let n = leaves.len().next_power_of_two();
+    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(n);
+    nodes.extend_from_slice(leaves);
+    while nodes.len() < n {
+        nodes.push([0u8; 32]);
     }
 
-    current_level[0]
+    // Bottom-up merge
+    while nodes.len() > 1 {
+        let mut next = Vec::with_capacity(nodes.len() / 2);
+        for i in (0..nodes.len()).step_by(2) {
+            let mut hasher = Sha256::new();
+            hasher.update(&nodes[i]);
+            hasher.update(&nodes[i + 1]);
+            let result = hasher.finalize();
+            let mut parent = [0u8; 32];
+            parent.copy_from_slice(&result);
+            next.push(parent);
+        }
+        nodes = next;
+    }
+
+    nodes[0]
 }

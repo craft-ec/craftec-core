@@ -6,29 +6,16 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Input to the distribution guest program.
+///
+/// Contains pre-aggregated (operator_pubkey, weight) entries and pool metadata.
+/// Receipt verification happens off-chain in the host/aggregator — the guest
+/// only builds the Merkle tree for on-chain compression.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DistributionInput {
-    /// The pool identifier (creator pubkey or pool pubkey).
+    /// Pre-aggregated (operator_pubkey, weight) entries.
+    pub entries: Vec<([u8; 32], u64)>,
+    /// Pool identifier (creator pubkey or pool pubkey).
     pub pool_id: [u8; 32],
-    /// Batch of receipts to verify and aggregate.
-    pub receipts: Vec<ReceiptData>,
-}
-
-/// A receipt in serialized form, generic across crafts.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ReceiptData {
-    /// Operator (node) public key — who earned this receipt.
-    pub operator: [u8; 32],
-    /// Signer public key — who issued/signed this receipt.
-    pub signer: [u8; 32],
-    /// Contribution weight (bytes forwarded, PDP proofs, etc.).
-    pub weight: u64,
-    /// Timestamp of the contribution.
-    pub timestamp: u64,
-    /// The signable payload (craft-specific canonical bytes).
-    pub signable_data: Vec<u8>,
-    /// Ed25519 signature over signable_data, by signer.
-    pub signature: Vec<u8>,
 }
 
 /// Committed output from the guest program (76 bytes).
@@ -71,13 +58,4 @@ impl DistributionOutput {
             pool_id,
         }
     }
-}
-
-/// A leaf in the distribution Merkle tree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DistributionEntry {
-    /// Operator public key.
-    pub operator: [u8; 32],
-    /// Aggregated weight for this operator.
-    pub weight: u64,
 }

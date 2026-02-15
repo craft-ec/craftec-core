@@ -9,4 +9,3 @@ edition = "2021"
 craftec-prover-guest-types = { path = "../prover-guest-types" }
 sp1-zkvm = "5.2"
 sha2 = "0.10"
-ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc"] }
