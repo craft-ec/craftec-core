@@ -1,0 +1,16 @@
+[package]
+name = "craftec-identity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+bs58 = "0.5"
+serde = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

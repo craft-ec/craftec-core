@@ -448,6 +448,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-identity"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "ed25519-dalek",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "craftec-ipc"
 version = "0.1.0"
 dependencies = [
