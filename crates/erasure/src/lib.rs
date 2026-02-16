@@ -1,195 +1,368 @@
-//! Craftec Erasure Coding
+//! Craftec Erasure Coding — RLNC (Random Linear Network Coding) over GF(2^8)
 //!
-//! Reed-Solomon erasure coding with configurable parameters.
-//! Each craft configures its own parameters:
-//! - TunnelCraft: 3/2 at 18KB (low-latency streaming)
-//! - DataCraft: 4/4 at 64KB (high-redundancy storage)
+//! Content is split into segments (default 10MB), each segment into k source pieces
+//! (default 100KB each). Coded pieces are random linear combinations of source pieces
+//! with coefficient vectors enabling reconstruction via Gaussian elimination.
 
-pub mod chunker;
+pub mod gf256;
+pub mod segmenter;
 
-use reed_solomon_erasure::galois_8::ReedSolomon;
+use gf256::GF256;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Default data shards (TunnelCraft-compatible defaults)
-pub const DATA_SHARDS: usize = 3;
-/// Default parity shards
-pub const PARITY_SHARDS: usize = 2;
-/// Default total shards
-pub const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+/// Default piece size: 100 KB
+pub const DEFAULT_PIECE_SIZE: usize = 102_400;
+/// Default segment size: 10 MB
+pub const DEFAULT_SEGMENT_SIZE: usize = 10_485_760;
+/// Default initial parity: 20% extra coded pieces
+pub const DEFAULT_INITIAL_PARITY: usize = 20;
 
-/// Configurable erasure coding parameters
+/// Configurable erasure coding parameters for RLNC
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErasureConfig {
-    pub data_shards: usize,
-    pub parity_shards: usize,
-    pub chunk_size: usize,
+    /// Size of each piece in bytes (default 100KB)
+    pub piece_size: usize,
+    /// Size of each segment in bytes (default 10MB)
+    pub segment_size: usize,
+    /// Number of extra coded pieces per segment (percentage, e.g. 20 = 1.2x)
+    pub initial_parity: usize,
 }
 
 impl Default for ErasureConfig {
     fn default() -> Self {
         Self {
-            data_shards: DATA_SHARDS,
-            parity_shards: PARITY_SHARDS,
-            chunk_size: 18_432, // 18 KB (TunnelCraft default)
+            piece_size: DEFAULT_PIECE_SIZE,
+            segment_size: DEFAULT_SEGMENT_SIZE,
+            initial_parity: DEFAULT_INITIAL_PARITY,
         }
     }
 }
 
 impl ErasureConfig {
-    pub fn total_shards(&self) -> usize {
-        self.data_shards + self.parity_shards
+    /// Number of source pieces for a full segment
+    pub fn k(&self) -> usize {
+        self.segment_size / self.piece_size
+    }
+
+    /// Number of source pieces for a segment of given byte size
+    pub fn k_for_segment(&self, segment_bytes: usize) -> usize {
+        segment_bytes.div_ceil(self.piece_size).max(1)
+    }
+
+    /// Number of extra coded pieces per segment
+    pub fn parity_count(&self, k: usize) -> usize {
+        (k * self.initial_parity) / 100
     }
 }
 
 #[derive(Error, Debug)]
 pub enum ErasureError {
-    #[error("Failed to create encoder: {0}")]
-    EncoderCreationFailed(String),
+    #[error("Empty data")]
+    EmptyData,
     #[error("Encoding failed: {0}")]
     EncodingFailed(String),
     #[error("Decoding failed: {0}")]
     DecodingFailed(String),
-    #[error("Insufficient shards: have {0}, need at least data_shards")]
-    InsufficientShards(usize),
-    #[error("Invalid shard size")]
-    InvalidShardSize,
-    #[error("Empty data")]
-    EmptyData,
+    #[error("Insufficient pieces: have {have}, need {need}")]
+    InsufficientPieces { have: usize, need: usize },
+    #[error("Pieces not linearly independent")]
+    LinearlyDependent,
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
 }
 
 pub type Result<T> = std::result::Result<T, ErasureError>;
 
-/// Erasure coder with configurable parameters
-pub struct ErasureCoder {
-    rs: ReedSolomon,
-    data_shards: usize,
-    parity_shards: usize,
+/// A coded piece: data bytes + coefficient vector
+#[derive(Debug, Clone)]
+pub struct CodedPiece {
+    /// The piece data (piece_size bytes)
+    pub data: Vec<u8>,
+    /// Coefficient vector (k bytes, one per source piece)
+    pub coefficients: Vec<u8>,
 }
 
-impl ErasureCoder {
-    /// Create a new erasure coder with default parameters (3/2)
-    pub fn new() -> Result<Self> {
-        Self::with_config_params(DATA_SHARDS, PARITY_SHARDS)
-    }
+/// RLNC Encoder: takes source data for a segment and produces coded pieces
+pub struct RlncEncoder {
+    /// Source pieces (k pieces, each piece_size bytes, last may be zero-padded)
+    source_pieces: Vec<Vec<u8>>,
+    piece_size: usize,
+}
 
-    /// Create a new erasure coder from an ErasureConfig
-    pub fn with_config(config: &ErasureConfig) -> Result<Self> {
-        Self::with_config_params(config.data_shards, config.parity_shards)
-    }
+impl RlncEncoder {
+    /// Create encoder from raw segment data
+    pub fn new(segment_data: &[u8], piece_size: usize) -> Result<Self> {
+        if segment_data.is_empty() {
+            return Err(ErasureError::EmptyData);
+        }
+        if piece_size == 0 {
+            return Err(ErasureError::InvalidConfig("piece_size must be > 0".into()));
+        }
 
-    /// Create a new erasure coder with explicit parameters
-    pub fn with_config_params(data_shards: usize, parity_shards: usize) -> Result<Self> {
-        let rs = ReedSolomon::new(data_shards, parity_shards)
-            .map_err(|e| ErasureError::EncoderCreationFailed(e.to_string()))?;
+        let k = segment_data.len().div_ceil(piece_size).max(1);
+        let mut source_pieces = Vec::with_capacity(k);
+
+        for i in 0..k {
+            let start = i * piece_size;
+            let end = (start + piece_size).min(segment_data.len());
+            let mut piece = vec![0u8; piece_size];
+            if start < segment_data.len() {
+                piece[..end - start].copy_from_slice(&segment_data[start..end]);
+            }
+            source_pieces.push(piece);
+        }
+
         Ok(Self {
-            rs,
-            data_shards,
-            parity_shards,
+            source_pieces,
+            piece_size,
         })
     }
 
-    pub fn data_shards(&self) -> usize {
-        self.data_shards
+    /// Number of source pieces (k)
+    pub fn k(&self) -> usize {
+        self.source_pieces.len()
     }
 
-    pub fn parity_shards(&self) -> usize {
-        self.parity_shards
+    /// Generate the k source pieces as coded pieces (identity coefficient vectors)
+    pub fn source_pieces(&self) -> Vec<CodedPiece> {
+        let k = self.k();
+        (0..k)
+            .map(|i| {
+                let mut coeffs = vec![0u8; k];
+                coeffs[i] = 1;
+                CodedPiece {
+                    data: self.source_pieces[i].clone(),
+                    coefficients: coeffs,
+                }
+            })
+            .collect()
     }
 
-    pub fn total_shards(&self) -> usize {
-        self.data_shards + self.parity_shards
+    /// Generate n coded pieces with random coefficient vectors
+    pub fn generate_coded_pieces(&self, n: usize) -> Vec<CodedPiece> {
+        let mut rng = rand::thread_rng();
+        (0..n).map(|_| self.generate_one_piece(&mut rng)).collect()
     }
 
-    /// Encode data into shards
-    pub fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
-        if data.is_empty() {
-            return Err(ErasureError::EmptyData);
+    /// Generate a single random coded piece
+    fn generate_one_piece(&self, rng: &mut impl Rng) -> CodedPiece {
+        let k = self.k();
+        let coeffs: Vec<u8> = (0..k).map(|_| rng.gen()).collect();
+        let data = Self::linear_combine(&self.source_pieces, &coeffs, self.piece_size);
+        CodedPiece {
+            data,
+            coefficients: coeffs,
         }
+    }
 
-        let shard_size = data.len().div_ceil(self.data_shards);
-        let total = self.total_shards();
-
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total);
-        for i in 0..self.data_shards {
-            let start = i * shard_size;
-            let end = std::cmp::min(start + shard_size, data.len());
-            let mut shard = vec![0u8; shard_size];
-            if start < data.len() {
-                shard[..end - start].copy_from_slice(&data[start..end]);
+    /// Compute a linear combination of pieces with given coefficients over GF(2^8)
+    fn linear_combine(pieces: &[Vec<u8>], coeffs: &[u8], piece_size: usize) -> Vec<u8> {
+        let mut result = vec![0u8; piece_size];
+        for (piece, &coeff) in pieces.iter().zip(coeffs.iter()) {
+            if coeff == 0 {
+                continue;
             }
-            shards.push(shard);
+            for (r, &p) in result.iter_mut().zip(piece.iter()) {
+                *r = GF256::add(*r, GF256::mul(coeff, p));
+            }
         }
-
-        for _ in 0..self.parity_shards {
-            shards.push(vec![0u8; shard_size]);
-        }
-
-        self.rs
-            .encode(&mut shards)
-            .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
-
-        Ok(shards)
+        result
     }
 
-    /// Decode data from shards
-    pub fn decode(&self, shards: &mut [Option<Vec<u8>>], original_len: usize) -> Result<Vec<u8>> {
-        let total = self.total_shards();
+    /// Encode a segment: returns source pieces + parity coded pieces
+    pub fn encode(&self, initial_parity_count: usize) -> Vec<CodedPiece> {
+        let mut pieces = self.source_pieces();
+        pieces.extend(self.generate_coded_pieces(initial_parity_count));
+        pieces
+    }
+}
 
-        if shards.len() != total {
-            return Err(ErasureError::InvalidShardSize);
+/// RLNC Decoder: collects coded pieces and reconstructs source data via Gaussian elimination
+pub struct RlncDecoder {
+    k: usize,
+    piece_size: usize,
+    original_size: usize,
+}
+
+impl RlncDecoder {
+    /// Create decoder for a segment with k source pieces
+    pub fn new(k: usize, piece_size: usize, original_segment_size: usize) -> Self {
+        Self {
+            k,
+            piece_size,
+            original_size: original_segment_size,
+        }
+    }
+
+    /// Decode k linearly independent coded pieces back to original segment data
+    pub fn decode(&self, pieces: &[CodedPiece]) -> Result<Vec<u8>> {
+        if pieces.len() < self.k {
+            return Err(ErasureError::InsufficientPieces {
+                have: pieces.len(),
+                need: self.k,
+            });
         }
 
-        // Count present shards and validate sizes
-        let mut present = 0;
-        let mut shard_size = 0;
-        for s in shards.iter().flatten() {
-            if shard_size == 0 {
-                shard_size = s.len();
-            } else if s.len() != shard_size {
-                return Err(ErasureError::InvalidShardSize);
+        // Build augmented matrix: [coefficients | data]
+        // We'll do Gaussian elimination on the coefficient part and apply same ops to data
+        let k = self.k;
+        let mut coeffs: Vec<Vec<u8>> = pieces.iter().take(k).map(|p| p.coefficients.clone()).collect();
+        let mut data: Vec<Vec<u8>> = pieces.iter().take(k).map(|p| p.data.clone()).collect();
+
+        // Gaussian elimination with partial pivoting
+        for col in 0..k {
+            // Find pivot
+            let pivot_row = (col..k)
+                .find(|&r| coeffs[r][col] != 0)
+                .ok_or(ErasureError::LinearlyDependent)?;
+
+            if pivot_row != col {
+                coeffs.swap(col, pivot_row);
+                data.swap(col, pivot_row);
             }
-            present += 1;
+
+            // Scale pivot row
+            let inv = GF256::inv(coeffs[col][col])
+                .ok_or_else(|| ErasureError::DecodingFailed("zero pivot".into()))?;
+
+            for v in coeffs[col].iter_mut() {
+                *v = GF256::mul(*v, inv);
+            }
+            for v in data[col].iter_mut() {
+                *v = GF256::mul(*v, inv);
+            }
+
+            // Eliminate column in all other rows
+            for row in 0..k {
+                if row == col {
+                    continue;
+                }
+                let factor = coeffs[row][col];
+                if factor == 0 {
+                    continue;
+                }
+                // Must clone pivot row to avoid borrow issues
+                let pivot_coeffs: Vec<u8> = coeffs[col].clone();
+                let pivot_data: Vec<u8> = data[col].clone();
+                for (cv, &pv) in coeffs[row].iter_mut().zip(pivot_coeffs.iter()) {
+                    *cv = GF256::add(*cv, GF256::mul(factor, pv));
+                }
+                for (dv, &pv) in data[row].iter_mut().zip(pivot_data.iter()) {
+                    *dv = GF256::add(*dv, GF256::mul(factor, pv));
+                }
+            }
         }
 
-        if present < self.data_shards {
-            return Err(ErasureError::InsufficientShards(present));
+        // After elimination, data[i] = source_piece[i]
+        let mut result = Vec::with_capacity(k * self.piece_size);
+        for row in &data {
+            result.extend_from_slice(row);
         }
-
-        self.rs
-            .reconstruct(shards)
-            .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
-
-        // Reassemble data from data shards
-        let mut result = Vec::with_capacity(shard_size * self.data_shards);
-        for s in shards.iter().take(self.data_shards).flatten() {
-            result.extend_from_slice(s);
-        }
-
-        result.truncate(original_len);
+        result.truncate(self.original_size);
         Ok(result)
     }
+}
 
-    /// Encode parity shards in-place from pre-split data + parity shard buffers.
-    ///
-    /// `shards` must contain exactly `data_shards + parity_shards` elements.
-    /// The first `data_shards` elements contain the data; the remaining parity
-    /// elements will be overwritten with computed parity data.
-    pub fn encode_shards(&self, shards: &mut [Vec<u8>]) -> Result<()> {
-        if shards.len() != self.total_shards() {
-            return Err(ErasureError::InvalidShardSize);
+/// Create a new coded piece by linearly combining existing coded pieces with random coefficients.
+///
+/// Takes 2+ coded pieces (data + coefficient vector each), returns a new piece
+/// that is a random linear combination of the inputs.
+pub fn create_piece_from_existing(pieces: &[CodedPiece]) -> Result<CodedPiece> {
+    if pieces.len() < 2 {
+        return Err(ErasureError::EncodingFailed(
+            "need at least 2 pieces to combine".into(),
+        ));
+    }
+
+    let k = pieces[0].coefficients.len();
+    let piece_size = pieces[0].data.len();
+
+    let mut rng = rand::thread_rng();
+    let alphas: Vec<u8> = (0..pieces.len())
+        .map(|_| {
+            // Avoid zero coefficients
+            loop {
+                let v: u8 = rng.gen();
+                if v != 0 {
+                    return v;
+                }
+            }
+        })
+        .collect();
+
+    let mut new_data = vec![0u8; piece_size];
+    let mut new_coeffs = vec![0u8; k];
+
+    for (piece, &alpha) in pieces.iter().zip(alphas.iter()) {
+        for (nd, &pd) in new_data.iter_mut().zip(piece.data.iter()) {
+            *nd = GF256::add(*nd, GF256::mul(alpha, pd));
         }
-        self.rs
-            .encode(shards)
-            .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
-        Ok(())
+        for (nc, &pc) in new_coeffs.iter_mut().zip(piece.coefficients.iter()) {
+            *nc = GF256::add(*nc, GF256::mul(alpha, pc));
+        }
     }
 
-    /// Verify that enough shards are present for reconstruction
-    pub fn verify(&self, shards: &[Option<Vec<u8>>]) -> bool {
-        let present = shards.iter().filter(|s| s.is_some()).count();
-        present >= self.data_shards
+    Ok(CodedPiece {
+        data: new_data,
+        coefficients: new_coeffs,
+    })
+}
+
+/// Check the rank (number of linearly independent vectors) of a set of coefficient vectors.
+pub fn check_independence(vectors: &[Vec<u8>]) -> usize {
+    if vectors.is_empty() {
+        return 0;
     }
+
+    let k = vectors[0].len();
+    let mut matrix: Vec<Vec<u8>> = vectors.to_vec();
+    let rows = matrix.len();
+    let mut rank = 0;
+
+    for col in 0..k {
+        // Find pivot in rows[rank..]
+        let pivot = (rank..rows).find(|&r| matrix[r][col] != 0);
+        let pivot = match pivot {
+            Some(p) => p,
+            None => continue,
+        };
+
+        matrix.swap(rank, pivot);
+
+        let inv = match GF256::inv(matrix[rank][col]) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Scale pivot row
+        for v in matrix[rank].iter_mut() {
+            *v = GF256::mul(*v, inv);
+        }
+
+        // Eliminate
+        for row in 0..rows {
+            if row == rank {
+                continue;
+            }
+            let factor = matrix[row][col];
+            if factor == 0 {
+                continue;
+            }
+            let pivot_row: Vec<u8> = matrix[rank].clone();
+            for (mv, &pv) in matrix[row].iter_mut().zip(pivot_row.iter()) {
+                *mv = GF256::add(*mv, GF256::mul(factor, pv));
+            }
+        }
+
+        rank += 1;
+        if rank == k {
+            break;
+        }
+    }
+
+    rank
 }
 
 #[cfg(test)]
@@ -199,18 +372,18 @@ mod tests {
     #[test]
     fn test_erasure_config_default() {
         let config = ErasureConfig::default();
-        assert_eq!(config.data_shards, 3);
-        assert_eq!(config.parity_shards, 2);
-        assert_eq!(config.chunk_size, 18_432);
-        assert_eq!(config.total_shards(), 5);
+        assert_eq!(config.piece_size, 102_400);
+        assert_eq!(config.segment_size, 10_485_760);
+        assert_eq!(config.initial_parity, 20);
+        assert_eq!(config.k(), 102); // 10_485_760 / 102_400 = 102
     }
 
     #[test]
     fn test_erasure_config_serde() {
         let config = ErasureConfig {
-            data_shards: 4,
-            parity_shards: 4,
-            chunk_size: 65536,
+            piece_size: 1024,
+            segment_size: 10240,
+            initial_parity: 20,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: ErasureConfig = serde_json::from_str(&json).unwrap();
@@ -218,111 +391,186 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_default() {
-        let coder = ErasureCoder::new().unwrap();
-        let data = b"Hello, Craftec!";
+    fn test_encode_decode_small() {
+        let data = b"Hello, Craftec RLNC!";
+        let piece_size = 8;
+        let encoder = RlncEncoder::new(data, piece_size).unwrap();
+        let k = encoder.k(); // ceil(20/8) = 3
 
-        let shards = coder.encode(data).unwrap();
-        assert_eq!(shards.len(), TOTAL_SHARDS);
+        let pieces = encoder.source_pieces();
+        assert_eq!(pieces.len(), k);
 
-        let mut shard_opts: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        let decoded = coder.decode(&mut shard_opts, data.len()).unwrap();
+        let decoder = RlncDecoder::new(k, piece_size, data.len());
+        let decoded = decoder.decode(&pieces).unwrap();
         assert_eq!(decoded, data);
     }
 
     #[test]
-    fn test_encode_decode_with_config() {
-        let config = ErasureConfig {
-            data_shards: 4,
-            parity_shards: 4,
-            chunk_size: 65536,
-        };
-        let coder = ErasureCoder::with_config(&config).unwrap();
-        let data = b"DataCraft erasure coding test";
+    fn test_encode_decode_with_coded_pieces() {
+        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        let piece_size = 100;
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+        let k = encoder.k(); // 5
 
-        let shards = coder.encode(data).unwrap();
-        assert_eq!(shards.len(), 8);
-
-        let mut shard_opts: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        let decoded = coder.decode(&mut shard_opts, data.len()).unwrap();
+        // Generate only coded (random) pieces, no source pieces
+        let coded = encoder.generate_coded_pieces(k + 5);
+        // Take first k coded pieces (should be enough if independent)
+        let decoder = RlncDecoder::new(k, piece_size, data.len());
+        let decoded = decoder.decode(&coded[..k]).unwrap();
         assert_eq!(decoded, data);
     }
 
     #[test]
-    fn test_decode_with_missing_shards() {
-        let coder = ErasureCoder::new().unwrap();
-        let data = b"Test data for reconstruction";
+    fn test_encode_decode_mixed_pieces() {
+        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let piece_size = 200;
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+        let k = encoder.k(); // 5
 
-        let shards = coder.encode(data).unwrap();
-        let mut shard_opts: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        let all = encoder.encode(3); // 5 source + 3 coded = 8
+        assert_eq!(all.len(), 8);
 
-        // Remove 2 shards (maximum tolerable loss for 3/2)
-        shard_opts[0] = None;
-        shard_opts[3] = None;
+        // Use a mix: skip source piece 0 and 2, use coded pieces instead
+        let mut selection: Vec<CodedPiece> = Vec::new();
+        selection.push(all[1].clone()); // source 1
+        selection.push(all[3].clone()); // source 3
+        selection.push(all[4].clone()); // source 4
+        selection.push(all[5].clone()); // coded 0
+        selection.push(all[6].clone()); // coded 1
 
-        let decoded = coder.decode(&mut shard_opts, data.len()).unwrap();
+        let decoder = RlncDecoder::new(k, piece_size, data.len());
+        let decoded = decoder.decode(&selection).unwrap();
         assert_eq!(decoded, data);
     }
 
     #[test]
-    fn test_decode_insufficient_shards() {
-        let coder = ErasureCoder::new().unwrap();
-        let data = b"Test data";
+    fn test_single_piece_k1() {
+        let data = b"tiny";
+        let piece_size = 100;
+        let encoder = RlncEncoder::new(data, piece_size).unwrap();
+        assert_eq!(encoder.k(), 1);
 
-        let shards = coder.encode(data).unwrap();
-        let mut shard_opts: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-
-        // Remove 3 shards (too many for 3/2)
-        shard_opts[0] = None;
-        shard_opts[1] = None;
-        shard_opts[2] = None;
-
-        let result = coder.decode(&mut shard_opts, data.len());
-        assert!(matches!(result, Err(ErasureError::InsufficientShards(_))));
+        let pieces = encoder.source_pieces();
+        let decoder = RlncDecoder::new(1, piece_size, data.len());
+        let decoded = decoder.decode(&pieces).unwrap();
+        assert_eq!(decoded, data);
     }
 
     #[test]
-    fn test_verify() {
-        let coder = ErasureCoder::new().unwrap();
-        let data = b"Verify test";
+    fn test_create_piece_from_existing() {
+        let data: Vec<u8> = (0..300).map(|i| (i % 256) as u8).collect();
+        let piece_size = 100;
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+        let k = encoder.k(); // 3
 
-        let shards = coder.encode(data).unwrap();
-        let mut shard_opts: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        let source = encoder.source_pieces();
+        let combined = create_piece_from_existing(&source[0..2]).unwrap();
 
-        assert!(coder.verify(&shard_opts));
+        // The combined piece should have k coefficients
+        assert_eq!(combined.coefficients.len(), k);
+        assert_eq!(combined.data.len(), piece_size);
 
-        shard_opts[0] = None;
-        shard_opts[1] = None;
-        assert!(coder.verify(&shard_opts));
-
-        shard_opts[2] = None;
-        assert!(!coder.verify(&shard_opts));
+        // Use combined piece + source[2] + source[0] to decode
+        let pieces_for_decode = vec![source[0].clone(), source[2].clone(), combined];
+        let decoder = RlncDecoder::new(k, piece_size, data.len());
+        let decoded = decoder.decode(&pieces_for_decode).unwrap();
+        assert_eq!(decoded, data);
     }
 
     #[test]
-    fn test_empty_data() {
-        let coder = ErasureCoder::new().unwrap();
-        let result = coder.encode(b"");
+    fn test_check_independence_full_rank() {
+        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        let piece_size = 100;
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+
+        let source = encoder.source_pieces();
+        let vecs: Vec<Vec<u8>> = source.iter().map(|p| p.coefficients.clone()).collect();
+        assert_eq!(check_independence(&vecs), 5);
+    }
+
+    #[test]
+    fn test_check_independence_dependent() {
+        // Create dependent vectors
+        let v1 = vec![1u8, 0, 0];
+        let v2 = vec![0u8, 1, 0];
+        // v3 = v1 XOR v2 (since add is XOR in GF(2^8))
+        let v3 = vec![1u8, 1, 0];
+        assert_eq!(check_independence(&[v1, v2, v3]), 2);
+    }
+
+    #[test]
+    fn test_check_independence_empty() {
+        assert_eq!(check_independence(&[]), 0);
+    }
+
+    #[test]
+    fn test_insufficient_pieces() {
+        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        let piece_size = 100;
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+
+        let source = encoder.source_pieces();
+        let decoder = RlncDecoder::new(5, piece_size, data.len());
+        let result = decoder.decode(&source[..3]);
+        assert!(matches!(
+            result,
+            Err(ErasureError::InsufficientPieces { have: 3, need: 5 })
+        ));
+    }
+
+    #[test]
+    fn test_empty_data_error() {
+        let result = RlncEncoder::new(b"", 100);
         assert!(matches!(result, Err(ErasureError::EmptyData)));
     }
 
     #[test]
-    fn test_4_4_config() {
-        let coder = ErasureCoder::with_config_params(4, 4).unwrap();
-        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+    fn test_large_k_roundtrip() {
+        // Simulate a realistic scenario with larger k
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let piece_size = 100;
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+        let k = encoder.k(); // 100
+        assert_eq!(k, 100);
 
-        let shards = coder.encode(&data).unwrap();
-        assert_eq!(shards.len(), 8);
+        let coded = encoder.generate_coded_pieces(k);
+        let decoder = RlncDecoder::new(k, piece_size, data.len());
+        let decoded = decoder.decode(&coded).unwrap();
+        assert_eq!(decoded, data);
+    }
 
-        let mut shard_opts: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+    #[test]
+    fn test_piece_size_not_dividing_evenly() {
+        let data: Vec<u8> = (0..250).map(|i| (i % 256) as u8).collect();
+        let piece_size = 100; // 250 / 100 = 2.5, ceil = 3
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+        assert_eq!(encoder.k(), 3);
 
-        // Remove 4 shards (maximum tolerable for 4/4)
-        shard_opts[0] = None;
-        shard_opts[2] = None;
-        shard_opts[5] = None;
-        shard_opts[7] = None;
+        let pieces = encoder.source_pieces();
+        let decoder = RlncDecoder::new(3, piece_size, data.len());
+        let decoded = decoder.decode(&pieces).unwrap();
+        assert_eq!(decoded, data);
+    }
 
-        let decoded = coder.decode(&mut shard_opts, data.len()).unwrap();
+    #[test]
+    fn test_create_piece_from_three_existing() {
+        let data: Vec<u8> = (0..400).map(|i| (i % 256) as u8).collect();
+        let piece_size = 100;
+        let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+        let k = encoder.k(); // 4
+
+        let source = encoder.source_pieces();
+        let combined = create_piece_from_existing(&source[0..3]).unwrap();
+
+        // Decode using combined + source[1] + source[2] + source[3]
+        let pieces_for_decode = vec![
+            combined,
+            source[1].clone(),
+            source[2].clone(),
+            source[3].clone(),
+        ];
+        let decoder = RlncDecoder::new(k, piece_size, data.len());
+        let decoded = decoder.decode(&pieces_for_decode).unwrap();
         assert_eq!(decoded, data);
     }
 }
