@@ -3,6 +3,17 @@
 //! Content is split into segments (default 10MB), each segment into k source pieces
 //! (default 100KB each). Coded pieces are random linear combinations of source pieces
 //! with coefficient vectors enabling reconstruction via Gaussian elimination.
+//!
+//! ## TODO: Performance Optimizations
+//! - **SIMD first** (biggest win): GF(2^8) multiply-accumulate via SSE/AVX2/NEON intrinsics.
+//!   Single-threaded SIMD beats naive rayon parallelism for RLNC — the inner loop is
+//!   sequential memory access over ~10MB (fits L3 cache), thread coordination overhead
+//!   and cache thrashing negate rayon's benefit at this granularity. See `rlnc` crate's
+//!   `gf256_inplace_mul_vec_by_scalar` for reference implementation.
+//! - **Rayon across segments** (outer loop only): Parallelize encoding/decoding of independent
+//!   segments. NOT within a single piece's GF(2^8) computation — that's SIMD territory.
+//! - **Evaluate `rlnc` crate** (https://crates.io/crates/rlnc): Published GF(2^8) RLNC
+//!   with SIMD support. Consider adopting their GF(2^8) primitives or the full crate.
 
 pub mod gf256;
 pub mod segmenter;
@@ -15,7 +26,7 @@ use thiserror::Error;
 /// Default piece size: 100 KB
 pub const DEFAULT_PIECE_SIZE: usize = 102_400;
 /// Default segment size: 10 MB
-pub const DEFAULT_SEGMENT_SIZE: usize = 10_485_760;
+pub const DEFAULT_SEGMENT_SIZE: usize = 10_240_000;
 /// Default initial parity: 20% extra coded pieces
 pub const DEFAULT_INITIAL_PARITY: usize = 20;
 
@@ -373,9 +384,9 @@ mod tests {
     fn test_erasure_config_default() {
         let config = ErasureConfig::default();
         assert_eq!(config.piece_size, 102_400);
-        assert_eq!(config.segment_size, 10_485_760);
+        assert_eq!(config.segment_size, 10_240_000);
         assert_eq!(config.initial_parity, 20);
-        assert_eq!(config.k(), 102); // 10_485_760 / 102_400 = 102
+        assert_eq!(config.k(), 100); // 10_240_000 / 102_400 = 100
     }
 
     #[test]
