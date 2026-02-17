@@ -23,10 +23,10 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Default piece size: 100 KB
-pub const DEFAULT_PIECE_SIZE: usize = 102_400;
-/// Default segment size: 10 MB
-pub const DEFAULT_SEGMENT_SIZE: usize = 10_240_000;
+/// Default piece size: 256 KiB (matches IPFS block size)
+pub const DEFAULT_PIECE_SIZE: usize = 262_144;
+/// Default segment size: 10 MiB = 40 × 256 KiB, k=40
+pub const DEFAULT_SEGMENT_SIZE: usize = 10_485_760;
 /// Default initial parity: 20% extra coded pieces
 pub const DEFAULT_INITIAL_PARITY: usize = 20;
 
@@ -383,10 +383,10 @@ mod tests {
     #[test]
     fn test_erasure_config_default() {
         let config = ErasureConfig::default();
-        assert_eq!(config.piece_size, 102_400);
-        assert_eq!(config.segment_size, 10_240_000);
+        assert_eq!(config.piece_size, 262_144);
+        assert_eq!(config.segment_size, 10_485_760);
         assert_eq!(config.initial_parity, 20);
-        assert_eq!(config.k(), 100); // 10_240_000 / 102_400 = 100
+        assert_eq!(config.k(), 40); // 10_485_760 / 262_144 = 40
     }
 
     #[test]
