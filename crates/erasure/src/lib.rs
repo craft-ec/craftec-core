@@ -329,7 +329,11 @@ pub fn create_piece_from_existing(pieces: &[CodedPiece]) -> Result<CodedPiece> {
 ///
 /// The returned vector can be used to create a new coded piece via recombination
 /// that is guaranteed to increase the rank by 1.
-pub fn generate_orthogonal_vector(existing: &[Vec<u8>], k: usize) -> Option<Vec<u8>> {
+/// `offset` selects which free column to target. Nodes ranked by independence
+/// contribution use their rank position as offset — each targets a different
+/// dimension of the null space. Offset 0 = first free column, 1 = second, etc.
+/// Wraps around if offset >= number of free columns.
+pub fn generate_orthogonal_vector(existing: &[Vec<u8>], k: usize, offset: usize) -> Option<Vec<u8>> {
     if k == 0 {
         return None;
     }
@@ -389,8 +393,18 @@ pub fn generate_orthogonal_vector(existing: &[Vec<u8>], k: usize) -> Option<Vec<
         return None; // Full rank, no independent vector possible
     }
 
-    // Find first free (non-pivot) column
-    let free_col = (0..k).find(|c| !pivot_cols.contains(c))?;
+    // Find all free (non-pivot) columns
+    let free_cols: Vec<usize> = (0..k).filter(|c| !pivot_cols.contains(c)).collect();
+
+    if free_cols.is_empty() {
+        return None;
+    }
+
+    // Use offset to select which free column this node targets.
+    // Different nodes use different offsets → each creates a piece in a different
+    // dimension of the null space → zero collisions even with simultaneous repair.
+    let col_index = offset % free_cols.len();
+    let free_col = free_cols[col_index];
 
     // Construct vector: e_{free_col} — a standard basis vector at the free column.
     // This is independent because no existing vector (after elimination) has a pivot there.
@@ -408,16 +422,19 @@ pub fn generate_orthogonal_vector(existing: &[Vec<u8>], k: usize) -> Option<Vec<
 /// `k` — number of source pieces for this segment
 ///
 /// Returns None if existing vectors already span the full space or local pieces are insufficient.
+/// `offset` — this node's rank position among providers. Each node targets a different
+/// free column, so simultaneous repairs create pieces in different null space dimensions.
 pub fn create_orthogonal_piece(
     local_pieces: &[CodedPiece],
     all_existing_coefficients: &[Vec<u8>],
     k: usize,
+    offset: usize,
 ) -> Option<CodedPiece> {
     if local_pieces.is_empty() || k == 0 {
         return None;
     }
 
-    let target = generate_orthogonal_vector(all_existing_coefficients, k)?;
+    let target = generate_orthogonal_vector(all_existing_coefficients, k, offset)?;
 
     // We need to find alphas such that: sum(alpha_i * local_pieces[i].coefficients) = target
     // This is a linear system over GF(2^8).
@@ -762,7 +779,7 @@ mod tests {
             vec![1u8, 0, 0, 0],
             vec![0u8, 1, 0, 0],
         ];
-        let result = generate_orthogonal_vector(&existing, 4).unwrap();
+        let result = generate_orthogonal_vector(&existing, 4, 0).unwrap();
         assert_eq!(result.len(), 4);
         // Adding the new vector should increase rank
         let mut all = existing.clone();
@@ -777,7 +794,7 @@ mod tests {
             vec![0u8, 1, 0],
             vec![0u8, 0, 1],
         ];
-        assert!(generate_orthogonal_vector(&existing, 3).is_none());
+        assert!(generate_orthogonal_vector(&existing, 3, 0).is_none());
     }
 
     #[test]
@@ -785,33 +802,33 @@ mod tests {
         let k = 5;
         let mut existing: Vec<Vec<u8>> = Vec::new();
         for i in 0..k {
-            let v = generate_orthogonal_vector(&existing, k).unwrap();
+            let v = generate_orthogonal_vector(&existing, k, 0).unwrap();
             assert_eq!(v.len(), k);
             existing.push(v);
             assert_eq!(check_independence(&existing), i + 1);
         }
         // Now full rank, should return None
-        assert!(generate_orthogonal_vector(&existing, k).is_none());
+        assert!(generate_orthogonal_vector(&existing, k, 0).is_none());
     }
 
     #[test]
     fn test_generate_orthogonal_empty_existing() {
-        let v = generate_orthogonal_vector(&[], 3).unwrap();
+        let v = generate_orthogonal_vector(&[], 3, 0).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(check_independence(&[v]), 1);
     }
 
     #[test]
     fn test_generate_orthogonal_k1() {
-        let v = generate_orthogonal_vector(&[], 1).unwrap();
+        let v = generate_orthogonal_vector(&[], 1, 0).unwrap();
         assert_eq!(v, vec![1]);
-        assert!(generate_orthogonal_vector(&[vec![1]], 1).is_none());
+        assert!(generate_orthogonal_vector(&[vec![1]], 1, 0).is_none());
     }
 
     #[test]
     fn test_generate_orthogonal_k2() {
         let existing = vec![vec![1u8, 1]];
-        let v = generate_orthogonal_vector(&existing, 2).unwrap();
+        let v = generate_orthogonal_vector(&existing, 2, 0).unwrap();
         let mut all = existing;
         all.push(v);
         assert_eq!(check_independence(&all), 2);
@@ -832,7 +849,7 @@ mod tests {
             source[1].coefficients.clone(),
         ];
 
-        let new_piece = create_orthogonal_piece(&local, &existing_coeffs, k).unwrap();
+        let new_piece = create_orthogonal_piece(&local, &existing_coeffs, k, 0).unwrap();
         assert_eq!(new_piece.coefficients.len(), k);
         assert_eq!(new_piece.data.len(), piece_size);
 
@@ -865,7 +882,37 @@ mod tests {
         // Existing already has e_0, so orthogonal would be e_1 or e_2
         // But local only has e_0, can't produce e_1 or e_2
         let existing = vec![vec![1u8, 0, 0]];
-        assert!(create_orthogonal_piece(&local, &existing, k).is_none());
+        assert!(create_orthogonal_piece(&local, &existing, k, 0).is_none());
+    }
+
+    #[test]
+    fn test_orthogonal_offset_targets_different_columns() {
+        // Two nodes repair simultaneously with different offsets → different pieces
+        let existing = vec![
+            vec![1u8, 0, 0, 0, 0],
+            vec![0u8, 1, 0, 0, 0],
+        ];
+        let k = 5;
+        // 3 free columns (2,3,4). Each offset targets a different one.
+        let v0 = generate_orthogonal_vector(&existing, k, 0).unwrap();
+        let v1 = generate_orthogonal_vector(&existing, k, 1).unwrap();
+        let v2 = generate_orthogonal_vector(&existing, k, 2).unwrap();
+
+        // All three should be different
+        assert_ne!(v0, v1);
+        assert_ne!(v1, v2);
+        assert_ne!(v0, v2);
+
+        // All should be independent from existing AND from each other
+        let mut all = existing.clone();
+        all.push(v0.clone());
+        all.push(v1);
+        all.push(v2);
+        assert_eq!(check_independence(&all), 5); // full rank
+
+        // Offset wraps: offset=3 should equal offset=0
+        let v3 = generate_orthogonal_vector(&existing, k, 3).unwrap();
+        assert_eq!(v3, v0);
     }
 
     #[test]
