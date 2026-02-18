@@ -2,7 +2,7 @@
 //!
 //! Combines Kademlia DHT, Identify, mDNS, Gossipsub, Rendezvous,
 //! Relay, DCUtR, AutoNAT, and persistent stream protocols.
-//! All protocol names are parameterized by a prefix (e.g., "tunnelcraft", "datacraft").
+//! All protocol names are parameterized by a prefix (e.g., "tunnelcraft", "craftobj").
 
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, relay, rendezvous,
@@ -121,8 +121,8 @@ impl CraftBehaviour {
     /// Called from [`build_swarm`](crate::node::build_swarm) inside the SwarmBuilder callback.
     /// The `relay_client` is provided by SwarmBuilder's `with_relay_client`.
     ///
-    /// `protocol_prefix` sets protocol names: e.g. `"datacraft"` yields
-    /// Kademlia `/datacraft/kad/1.0.0`, identify `/datacraft/id/1.0.0`.
+    /// `protocol_prefix` sets protocol names: e.g. `"craftobj"` yields
+    /// Kademlia `/craftobj/kad/1.0.0`, identify `/craftobj/id/1.0.0`.
     pub fn build(
         protocol_prefix: &str,
         local_peer_id: PeerId,

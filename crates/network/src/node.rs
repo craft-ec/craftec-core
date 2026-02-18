@@ -113,11 +113,11 @@ mod tests {
     #[test]
     fn test_config_custom_prefix() {
         let config = NetworkConfig {
-            protocol_prefix: "datacraft".to_string(),
+            protocol_prefix: "craftobj".to_string(),
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/9100".parse().unwrap()],
             bootstrap_peers: Vec::new(),
         };
-        assert_eq!(config.protocol_prefix, "datacraft");
+        assert_eq!(config.protocol_prefix, "craftobj");
     }
 
     #[tokio::test]

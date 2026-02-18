@@ -197,13 +197,13 @@ mod tests {
 
     #[test]
     fn test_default_paths() {
-        let keystore_dir = default_keystore_dir_for("datacraft");
+        let keystore_dir = default_keystore_dir_for("craftobj");
         assert!(keystore_dir.to_string_lossy().contains("keys"));
 
-        let config_dir = default_config_dir_for("datacraft");
+        let config_dir = default_config_dir_for("craftobj");
         assert!(!config_dir.to_string_lossy().is_empty());
 
-        let key_path = default_key_path_for("datacraft");
+        let key_path = default_key_path_for("craftobj");
         assert!(key_path.to_string_lossy().contains("signing.key"));
     }
 

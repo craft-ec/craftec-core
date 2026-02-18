@@ -28,9 +28,9 @@ pub type Result<T> = std::result::Result<T, SettingsError>;
 
 /// Generic settings wrapper for any serializable config type.
 ///
-/// Each craft defines its own config struct (e.g., `DataCraftConfig`) and wraps it:
+/// Each craft defines its own config struct (e.g., `CraftOBJConfig`) and wraps it:
 /// ```ignore
-/// let settings: Settings<DataCraftConfig> = Settings::load_or_default("datacraft", None)?;
+/// let settings: Settings<CraftOBJConfig> = Settings::load_or_default("craftobj", None)?;
 /// ```
 pub struct Settings<T> {
     pub config: T,
