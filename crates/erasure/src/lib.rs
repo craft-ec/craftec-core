@@ -16,9 +16,16 @@
 //!   with SIMD support. Consider adopting their GF(2^8) primitives or the full crate.
 
 pub mod gf256;
+pub mod homomorphic;
 pub mod segmenter;
 
 use gf256::GF256;
+
+// Re-export homomorphic hashing functionality
+pub use homomorphic::{
+    generate_segment_hashes, verify_piece, ContentVerificationRecord, SegmentHashes,
+    HASH_PROJECTIONS,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
