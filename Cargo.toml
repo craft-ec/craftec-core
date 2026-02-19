@@ -15,6 +15,7 @@ members = [
     "crates/prover-guest-types",
     "crates/prover",
     "crates/aggregator",
+    "crates/agent-runtime",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ craftec-settlement = { path = "crates/settlement" }
 craftec-prover-guest-types = { path = "crates/prover-guest-types" }
 craftec-prover = { path = "crates/prover" }
 craftec-aggregator = { path = "crates/aggregator" }
+craftec-agent-runtime = { path = "crates/agent-runtime" }
 
 # Async
 tokio = { version = "1.35", features = ["full"] }
