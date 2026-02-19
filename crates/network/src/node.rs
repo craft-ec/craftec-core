@@ -26,6 +26,9 @@ pub struct NetworkConfig {
     pub listen_addrs: Vec<Multiaddr>,
     /// Bootstrap peers to connect to on startup.
     pub bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    /// Enable mDNS for local network discovery (default: true).
+    /// Disable in test environments to prevent cross-test node discovery.
+    pub enable_mdns: bool,
 }
 
 impl Default for NetworkConfig {
@@ -34,6 +37,7 @@ impl Default for NetworkConfig {
             protocol_prefix: "craftec".to_string(),
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".parse().expect("valid multiaddr")],
             bootstrap_peers: Vec::new(),
+            enable_mdns: true,
         }
     }
 }
@@ -62,6 +66,7 @@ pub async fn build_swarm(
     info!("Local peer ID: {}", local_peer_id);
 
     let protocol_prefix = config.protocol_prefix.clone();
+    let enable_mdns = config.enable_mdns;
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -75,7 +80,7 @@ pub async fn build_swarm(
         .map_err(|e| NetworkError::SwarmBuildError(e.to_string()))?
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = PeerId::from(key.public());
-            CraftBehaviour::build(&protocol_prefix, peer_id, key, relay_behaviour)
+            CraftBehaviour::build_with_options(&protocol_prefix, peer_id, key, relay_behaviour, enable_mdns)
         })
         .map_err(|e| NetworkError::SwarmBuildError(format!("{:?}", e)))?
         .with_swarm_config(|c| {

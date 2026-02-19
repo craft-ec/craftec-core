@@ -6,7 +6,7 @@
 
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, relay, rendezvous,
-    swarm::NetworkBehaviour,
+    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
     Multiaddr, PeerId, StreamProtocol,
 };
 use std::time::Duration;
@@ -22,8 +22,8 @@ pub struct CraftBehaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     /// Identify protocol for peer info exchange
     pub identify: identify::Behaviour,
-    /// mDNS for local network discovery
-    pub mdns: mdns::tokio::Behaviour,
+    /// mDNS for local network discovery (disabled via Toggle when not needed)
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     /// Gossipsub for pub/sub messaging
     pub gossipsub: gossipsub::Behaviour,
     /// Rendezvous client for decentralized discovery
@@ -123,11 +123,23 @@ impl CraftBehaviour {
     ///
     /// `protocol_prefix` sets protocol names: e.g. `"craftobj"` yields
     /// Kademlia `/craftobj/kad/1.0.0`, identify `/craftobj/id/1.0.0`.
+    /// Build with mDNS enabled (default).
     pub fn build(
         protocol_prefix: &str,
         local_peer_id: PeerId,
         keypair: &libp2p::identity::Keypair,
         relay_client: relay::client::Behaviour,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build_with_options(protocol_prefix, local_peer_id, keypair, relay_client, true)
+    }
+
+    /// Build with optional mDNS.
+    pub fn build_with_options(
+        protocol_prefix: &str,
+        local_peer_id: PeerId,
+        keypair: &libp2p::identity::Keypair,
+        relay_client: relay::client::Behaviour,
+        enable_mdns: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Kademlia
         let kad_protocol = StreamProtocol::try_from_owned(
@@ -146,11 +158,15 @@ impl CraftBehaviour {
         .with_agent_version(format!("{}/{}", protocol_prefix, env!("CARGO_PKG_VERSION")));
         let identify = identify::Behaviour::new(identify_config);
 
-        // mDNS
-        let mdns = mdns::tokio::Behaviour::new(
-            mdns::Config::default(),
-            local_peer_id,
-        )?;
+        // mDNS (optional — disabled in test environments to prevent cross-test discovery)
+        let mdns = if enable_mdns {
+            Toggle::from(Some(mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                local_peer_id,
+            )?))
+        } else {
+            Toggle::from(None)
+        };
 
         // Gossipsub
         let gossipsub_config = gossipsub::ConfigBuilder::default()
