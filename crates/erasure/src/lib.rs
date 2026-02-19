@@ -1,7 +1,7 @@
 //! Craftec Erasure Coding — RLNC (Random Linear Network Coding) over GF(2^8)
 //!
 //! Content is split into segments (default 10MB), each segment into k source pieces
-//! (default 100KB each). Coded pieces are random linear combinations of source pieces
+//! (default 256KB each). Coded pieces are random linear combinations of source pieces
 //! with coefficient vectors enabling reconstruction via Gaussian elimination.
 //!
 //! ## TODO: Performance Optimizations
@@ -40,7 +40,7 @@ pub const DEFAULT_INITIAL_PARITY: usize = 20;
 /// Configurable erasure coding parameters for RLNC
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErasureConfig {
-    /// Size of each piece in bytes (default 100KB)
+    /// Size of each piece in bytes (default 256KB)
     pub piece_size: usize,
     /// Size of each segment in bytes (default 10MB)
     pub segment_size: usize,
