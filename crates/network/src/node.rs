@@ -46,8 +46,8 @@ impl Default for NetworkConfig {
 fn yamux_config() -> yamux::Config {
     let mut cfg = yamux::Config::default();
     cfg.set_max_num_streams(4096);
-    cfg.set_receive_window_size(1024 * 1024);
-    cfg.set_max_buffer_size(1024 * 1024);
+    cfg.set_receive_window_size(16 * 1024 * 1024);  // 16MB — allows 10MB segment transfers without window updates
+    cfg.set_max_buffer_size(16 * 1024 * 1024);
     cfg
 }
 

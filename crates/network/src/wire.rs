@@ -23,6 +23,7 @@ pub struct RawFrame {
 /// Returns the seq_id, message type byte, and payload.
 /// Craft-specific code maps msg_type to request/response variants.
 pub async fn read_raw_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<RawFrame> {
+    let frame_start = std::time::Instant::now();
     // seq_id (8 bytes)
     let mut seq_bytes = [0u8; 8];
     io.read_exact(&mut seq_bytes).await?;
@@ -36,6 +37,7 @@ pub async fn read_raw_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<RawF
     let mut len_bytes = [0u8; 4];
     io.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
+    let header_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
 
     if len > MAX_FRAME_PAYLOAD {
         return Err(io::Error::new(
@@ -44,9 +46,16 @@ pub async fn read_raw_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<RawF
         ));
     }
 
+    let payload_start = std::time::Instant::now();
     let mut payload = vec![0u8; len];
     if len > 0 {
         io.read_exact(&mut payload).await?;
+    }
+    let payload_ms = payload_start.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+
+    if len > 100_000 {
+        tracing::info!("[wire] read_frame: type=0x{:02x} len={} header={:.1}ms payload={:.1}ms total={:.1}ms", ty[0], len, header_ms, payload_ms, total_ms);
     }
 
     Ok(RawFrame { seq_id, msg_type: ty[0], payload })
@@ -73,8 +82,16 @@ pub async fn write_raw_frame<T: AsyncWrite + Unpin>(
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(payload);
 
+    let write_start = std::time::Instant::now();
     io.write_all(&buf).await?;
+    let write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
+    let flush_start = std::time::Instant::now();
     io.flush().await?;
+    let flush_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
+
+    if payload.len() > 100_000 {
+        tracing::info!("[wire] write_frame: type=0x{:02x} len={} write={:.1}ms flush={:.1}ms", msg_type, payload.len(), write_ms, flush_ms);
+    }
     Ok(())
 }
 
