@@ -147,7 +147,15 @@ impl CraftBehaviour {
         )?;
         let mut kad_config = kad::Config::new(kad_protocol);
         kad_config.set_query_timeout(Duration::from_secs(60));
-        let store = kad::store::MemoryStore::new(local_peer_id);
+        // Default Kademlia max_packet_size is 16KB — too small for manifests
+        // of large content (100MB → ~62KB manifest). Increase to 512KB.
+        kad_config.set_max_packet_size(512 * 1024);
+        // Increase record limits: manifests can be ~60KB+ for large content,
+        // and verification records add more. Default 65KB is too tight.
+        let mut store_config = kad::store::MemoryStoreConfig::default();
+        store_config.max_value_bytes = 256 * 1024; // 256KB per record
+        store_config.max_records = 4096;
+        let store = kad::store::MemoryStore::with_config(local_peer_id, store_config);
         let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
 
         // Identify
