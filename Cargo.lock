@@ -2113,6 +2113,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "rand 0.8.5",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

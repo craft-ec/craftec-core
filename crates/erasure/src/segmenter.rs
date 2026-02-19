@@ -12,27 +12,33 @@ use crate::{CodedPiece, ErasureConfig, ErasureError, Result, RlncDecoder, RlncEn
 /// Returns Vec<(segment_index, Vec<CodedPiece>)> where each segment's pieces
 /// include source pieces + initial parity coded pieces.
 pub fn segment_and_encode(data: &[u8], config: &ErasureConfig) -> Result<Vec<(u32, Vec<CodedPiece>)>> {
+    use rayon::prelude::*;
+
     if data.is_empty() {
         return Err(ErasureError::EmptyData);
     }
 
     let num_segments = data.len().div_ceil(config.segment_size);
-    let mut result = Vec::with_capacity(num_segments);
 
-    for i in 0..num_segments {
-        let start = i * config.segment_size;
-        let end = (start + config.segment_size).min(data.len());
-        let segment_data = &data[start..end];
+    // Encode all segments in parallel
+    let results: Vec<Result<(u32, Vec<CodedPiece>)>> = (0..num_segments)
+        .into_par_iter()
+        .map(|i| {
+            let start = i * config.segment_size;
+            let end = (start + config.segment_size).min(data.len());
+            let segment_data = &data[start..end];
 
-        let encoder = RlncEncoder::new(segment_data, config.piece_size)?;
-        let k = encoder.k();
-        let parity_count = config.parity_count(k);
-        let pieces = encoder.encode(parity_count);
+            let encoder = RlncEncoder::new(segment_data, config.piece_size)?;
+            let k = encoder.k();
+            let parity_count = config.parity_count(k);
+            let pieces = encoder.encode(parity_count);
 
-        result.push((i as u32, pieces));
-    }
+            Ok((i as u32, pieces))
+        })
+        .collect();
 
-    Ok(result)
+    // Collect results, propagate first error
+    results.into_iter().collect()
 }
 
 /// Decode segments back to original content.
@@ -46,21 +52,31 @@ pub fn decode_and_reassemble(
     config: &ErasureConfig,
     original_len: usize,
 ) -> Result<Vec<u8>> {
+    use rayon::prelude::*;
+
+    // Decode all segments in parallel
+    let decoded_segments: Vec<Result<(u32, Vec<u8>)>> = (0..total_segments)
+        .into_par_iter()
+        .map(|i| {
+            let pieces = segments.get(&i).ok_or_else(|| {
+                ErasureError::DecodingFailed(format!("missing segment {}", i))
+            })?;
+
+            let segment_start = i as usize * config.segment_size;
+            let segment_end = ((i as usize + 1) * config.segment_size).min(original_len);
+            let segment_len = segment_end - segment_start;
+            let k = config.k_for_segment(segment_len);
+
+            let decoder = RlncDecoder::new(k, config.piece_size, segment_len);
+            let decoded = decoder.decode(pieces)?;
+            Ok((i, decoded))
+        })
+        .collect();
+
+    // Reassemble in order
     let mut result = Vec::with_capacity(original_len);
-
-    for i in 0..total_segments {
-        let pieces = segments.get(&i).ok_or_else(|| {
-            ErasureError::DecodingFailed(format!("missing segment {}", i))
-        })?;
-
-        // Determine segment size (last segment may be smaller)
-        let segment_start = i as usize * config.segment_size;
-        let segment_end = ((i as usize + 1) * config.segment_size).min(original_len);
-        let segment_len = segment_end - segment_start;
-        let k = config.k_for_segment(segment_len);
-
-        let decoder = RlncDecoder::new(k, config.piece_size, segment_len);
-        let decoded = decoder.decode(pieces)?;
+    for item in decoded_segments {
+        let (_seg_idx, decoded) = item?;
         result.extend_from_slice(&decoded);
     }
 
