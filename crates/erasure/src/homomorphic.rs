@@ -20,13 +20,39 @@ pub struct SegmentHashes {
     pub piece_hashes: Vec<[u8; HASH_PROJECTIONS]>,
 }
 
-/// Complete verification record for a content ID (replaces manifest).
+/// Complete verification record for a content ID (replaces manifest on fetch path).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContentVerificationRecord {
     /// Original file size in bytes (used to derive segment_count and last segment k)
     pub file_size: u64,
     /// Per-segment homomorphic hashes
     pub segment_hashes: Vec<SegmentHashes>,
+}
+
+impl ContentVerificationRecord {
+    /// Derive segment count from file_size using default erasure config constants.
+    pub fn segment_count(&self) -> usize {
+        if self.file_size == 0 {
+            return 0;
+        }
+        (self.file_size as usize).div_ceil(super::DEFAULT_SEGMENT_SIZE)
+    }
+
+    /// Derive k (number of source pieces) for a specific segment.
+    pub fn k_for_segment(&self, segment_index: usize) -> usize {
+        let seg_count = self.segment_count();
+        if seg_count == 0 {
+            return 0;
+        }
+        if segment_index + 1 < seg_count {
+            // Full segment
+            super::DEFAULT_SEGMENT_SIZE / super::DEFAULT_PIECE_SIZE
+        } else {
+            // Last segment — may be partial
+            let remaining = self.file_size as usize - segment_index * super::DEFAULT_SEGMENT_SIZE;
+            remaining.div_ceil(super::DEFAULT_PIECE_SIZE).max(1)
+        }
+    }
 }
 
 /// Generate homomorphic hashes for all original pieces in a segment.

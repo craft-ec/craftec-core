@@ -10,6 +10,9 @@ pub mod behaviour;
 pub mod node;
 pub mod bootstrap;
 pub mod error;
+pub mod pex;
+pub mod pex_wire;
+pub mod wire;
 
 pub use behaviour::CraftBehaviour;
 pub use node::{build_swarm, NetworkConfig, CraftSwarm};
