@@ -182,8 +182,9 @@ impl RlncEncoder {
             if coeff == 0 {
                 continue;
             }
+            let table = GF256::mul_table(coeff);
             for (r, &p) in result.iter_mut().zip(piece.iter()) {
-                *r = GF256::add(*r, GF256::mul(coeff, p));
+                *r ^= table[p as usize];
             }
         }
         result
@@ -241,15 +242,16 @@ impl RlncDecoder {
                 data.swap(col, pivot_row);
             }
 
-            // Scale pivot row
+            // Scale pivot row using precomputed multiplication table
             let inv = GF256::inv(coeffs[col][col])
                 .ok_or_else(|| ErasureError::DecodingFailed("zero pivot".into()))?;
 
+            let inv_table = GF256::mul_table(inv);
             for v in coeffs[col].iter_mut() {
-                *v = GF256::mul(*v, inv);
+                *v = inv_table[*v as usize];
             }
             for v in data[col].iter_mut() {
-                *v = GF256::mul(*v, inv);
+                *v = inv_table[*v as usize];
             }
 
             // Eliminate column in all other rows
@@ -261,14 +263,23 @@ impl RlncDecoder {
                 if factor == 0 {
                     continue;
                 }
-                // Must clone pivot row to avoid borrow issues
+                let factor_table = GF256::mul_table(factor);
+                // Use split_at_mut pattern to avoid cloning pivot row
+                // For coefficients (small, k bytes): clone is fine
                 let pivot_coeffs: Vec<u8> = coeffs[col].clone();
-                let pivot_data: Vec<u8> = data[col].clone();
                 for (cv, &pv) in coeffs[row].iter_mut().zip(pivot_coeffs.iter()) {
-                    *cv = GF256::add(*cv, GF256::mul(factor, pv));
+                    *cv ^= factor_table[pv as usize];
                 }
-                for (dv, &pv) in data[row].iter_mut().zip(pivot_data.iter()) {
-                    *dv = GF256::add(*dv, GF256::mul(factor, pv));
+                // For data (large, piece_size bytes): use index trick to avoid clone
+                let (first, second) = if row < col {
+                    let (a, b) = data.split_at_mut(col);
+                    (&mut a[row], &b[0])
+                } else {
+                    let (a, b) = data.split_at_mut(row);
+                    (&mut b[0], &a[col])
+                };
+                for (dv, &pv) in first.iter_mut().zip(second.iter()) {
+                    *dv ^= factor_table[pv as usize];
                 }
             }
         }

@@ -54,6 +54,23 @@ impl GF256 {
         tables.exp[log_sum as usize]
     }
 
+    /// Build a 256-entry lookup table for multiplication by a fixed scalar.
+    /// `table[x] = a * x` in GF(2^8). Avoids per-byte log/exp lookups in hot loops.
+    #[inline]
+    pub fn mul_table(a: u8) -> [u8; 256] {
+        let mut table = [0u8; 256];
+        if a == 0 {
+            return table;
+        }
+        let tables = &*TABLES;
+        let log_a = tables.log[a as usize] as u16;
+        for x in 1..=255u8 {
+            let log_sum = (log_a + tables.log[x as usize] as u16) % 255;
+            table[x as usize] = tables.exp[log_sum as usize];
+        }
+        table
+    }
+
     /// Multiplicative inverse in GF(2^8). Returns None for 0.
     #[inline]
     pub fn inv(a: u8) -> Option<u8> {
