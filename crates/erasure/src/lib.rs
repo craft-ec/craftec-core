@@ -934,6 +934,50 @@ mod tests {
     }
 
     #[test]
+    fn bench_decode_speed() {
+        use std::time::Instant;
+
+        let k = 40;
+        let piece_size = 262_144;
+        let segment_size = k * piece_size;
+        let num_segments = 10;
+
+        let mut total_encode = std::time::Duration::ZERO;
+        let mut total_decode = std::time::Duration::ZERO;
+
+        for seg in 0..num_segments {
+            // Generate random segment data
+            let data: Vec<u8> = (0..segment_size).map(|i| ((i + seg * 7) % 256) as u8).collect();
+
+            let t0 = Instant::now();
+            let encoder = RlncEncoder::new(&data, piece_size).unwrap();
+            let coded = encoder.generate_coded_pieces(k);
+            let encode_time = t0.elapsed();
+            total_encode += encode_time;
+
+            let decoder = RlncDecoder::new(k, piece_size, data.len());
+            let t1 = Instant::now();
+            let decoded = decoder.decode(&coded).unwrap();
+            let decode_time = t1.elapsed();
+            total_decode += decode_time;
+
+            assert_eq!(decoded, data);
+            println!(
+                "Segment {}: encode={:.1}ms decode={:.1}ms",
+                seg,
+                encode_time.as_secs_f64() * 1000.0,
+                decode_time.as_secs_f64() * 1000.0
+            );
+        }
+
+        let total_mb = (num_segments * segment_size) as f64 / (1024.0 * 1024.0);
+        println!("\n=== RLNC Benchmark Results ===");
+        println!("Total data: {:.0} MB ({} segments × {}KB pieces, k={})", total_mb, num_segments, piece_size / 1024, k);
+        println!("Total encode: {:.1}ms ({:.1} MB/s)", total_encode.as_secs_f64() * 1000.0, total_mb / total_encode.as_secs_f64());
+        println!("Total decode: {:.1}ms ({:.1} MB/s)", total_decode.as_secs_f64() * 1000.0, total_mb / total_decode.as_secs_f64());
+    }
+
+    #[test]
     fn test_create_piece_from_three_existing() {
         let data: Vec<u8> = (0..400).map(|i| (i % 256) as u8).collect();
         let piece_size = 100;
