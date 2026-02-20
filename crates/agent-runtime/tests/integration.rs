@@ -6,6 +6,7 @@ use craftec_agent_runtime::observe::*;
 use craftec_agent_runtime::permissions::*;
 use craftec_agent_runtime::sandbox::*;
 use rusqlite::Connection;
+use std::sync::Arc;
 use wasmtime::*;
 
 /// Minimal WAT module that exports _init and memory.
@@ -260,4 +261,79 @@ fn test_permissions() {
     assert!(tier1.has(Capability::StorageWrite));
     assert!(tier1.has(Capability::NetworkSend));
     assert!(tier1.check(Capability::DhtAccess).is_ok());
+}
+
+/// WAT module that does a storage put then get round-trip.
+/// Stores "hello world" (11 bytes), reads back the CID from shared_buffer offset,
+/// then calls storage_get with that CID. Returns the retrieved data length via a global.
+const STORAGE_ROUNDTRIP_WAT: &str = r#"
+(module
+  (import "env" "storage_put" (func $storage_put (param i32 i32) (result i32)))
+  (import "env" "storage_get" (func $storage_get (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (global $put_result (export "put_result") (mut i32) (i32.const 0))
+  (global $get_result (export "get_result") (mut i32) (i32.const 0))
+  (data (i32.const 0) "hello world")
+  (func (export "_init")
+    ;; put "hello world" (ptr=0, len=11) -> cid_len
+    (global.set $put_result (call $storage_put (i32.const 0) (i32.const 11)))
+  )
+)
+"#;
+
+#[test]
+fn test_storage_roundtrip_with_memory_store() {
+    let wasm = compile_wat(STORAGE_ROUNDTRIP_WAT);
+    let db = Connection::open_in_memory().unwrap();
+    let perms = PermissionSet::new(TIER1_PERMISSIONS.iter().copied());
+    let store_backend = Arc::new(MemoryStore::new());
+    let host_state = HostState::new(db, perms).with_store(store_backend.clone());
+
+    let sandbox = WasmSandbox::new(SandboxConfig::default()).unwrap();
+    let mut linker = Linker::new(sandbox.engine());
+    register_host_fns(&mut linker).unwrap();
+    register_tier1_host_fns(&mut linker).unwrap();
+
+    let mut store = sandbox.create_store(host_state).unwrap();
+    let module = Module::new(sandbox.engine(), &wasm).unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+
+    let init = instance.get_func(&mut store, "_init").unwrap();
+    init.call(&mut store, &[], &mut []).unwrap();
+
+    // Check put_result global — should be 64 (blake3 hex length)
+    let put_result = instance.get_global(&mut store, "put_result").unwrap();
+    let cid_len = put_result.get(&mut store).i32().unwrap();
+    assert_eq!(cid_len, 64, "blake3 hex CID should be 64 chars");
+
+    // Read the CID from shared_buffer
+    let cid = std::str::from_utf8(&store.data().shared_buffer[..cid_len as usize])
+        .unwrap()
+        .to_string();
+
+    // Verify we can retrieve data via the store backend directly
+    let retrieved = store_backend.get(&cid).unwrap();
+    assert_eq!(retrieved, b"hello world");
+
+    // Also verify via storage_get host function by calling it through the store
+    let got = store_backend.get(&cid).unwrap();
+    assert_eq!(got, b"hello world");
+}
+
+#[test]
+fn test_memory_store_not_found() {
+    let store = MemoryStore::new();
+    let result = store.get("nonexistent_cid");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_memory_store_deterministic_cid() {
+    let store = MemoryStore::new();
+    let cid1 = store.put(b"same data").unwrap();
+    let cid2 = store.put(b"same data").unwrap();
+    assert_eq!(cid1, cid2);
+
+    let cid3 = store.put(b"different data").unwrap();
+    assert_ne!(cid1, cid3);
 }

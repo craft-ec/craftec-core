@@ -121,6 +121,7 @@ mod tests {
             protocol_prefix: "craftobj".to_string(),
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/9100".parse().unwrap()],
             bootstrap_peers: Vec::new(),
+            enable_mdns: true,
         };
         assert_eq!(config.protocol_prefix, "craftobj");
     }

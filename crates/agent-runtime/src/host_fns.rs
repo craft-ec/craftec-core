@@ -4,6 +4,48 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
+/// Trait for content-addressed blob storage used by agent host functions.
+///
+/// Implementations must be thread-safe. The `put` method stores raw bytes and
+/// returns a CID string (hex-encoded blake3 hash). The `get` method retrieves
+/// bytes by CID.
+pub trait AgentStore: Send + Sync {
+    /// Store bytes, return CID string.
+    fn put(&self, data: &[u8]) -> Result<String, String>;
+    /// Retrieve bytes by CID. Returns None if not found.
+    fn get(&self, cid: &str) -> Result<Vec<u8>, String>;
+}
+
+/// In-memory implementation of [`AgentStore`] for testing.
+#[derive(Default)]
+pub struct MemoryStore {
+    data: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl MemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl AgentStore for MemoryStore {
+    fn put(&self, data: &[u8]) -> Result<String, String> {
+        let hash = blake3::hash(data);
+        let cid = hash.to_hex().to_string();
+        self.data.lock().unwrap().insert(cid.clone(), data.to_vec());
+        Ok(cid)
+    }
+
+    fn get(&self, cid: &str) -> Result<Vec<u8>, String> {
+        self.data
+            .lock()
+            .unwrap()
+            .get(cid)
+            .cloned()
+            .ok_or_else(|| format!("not found: {cid}"))
+    }
+}
+
 /// Shared state accessible by host functions for a single agent.
 pub struct HostState {
     pub db: Arc<Mutex<Connection>>,
@@ -13,6 +55,8 @@ pub struct HostState {
     pub events: Arc<Mutex<Vec<Event>>>,
     /// Shared memory buffer for passing data between host and guest.
     pub shared_buffer: Vec<u8>,
+    /// Optional content-addressed store for storage_put / storage_get.
+    pub store: Option<Arc<dyn AgentStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,8 +79,15 @@ impl HostState {
             config: HashMap::new(),
             logs: Arc::new(Mutex::new(Vec::new())),
             events: Arc::new(Mutex::new(Vec::new())),
-            shared_buffer: vec![0u8; 4096],
+            shared_buffer: vec![0u8; 64 * 1024],
+            store: None,
         }
+    }
+
+    /// Set the content-addressed store backend.
+    pub fn with_store(mut self, store: Arc<dyn AgentStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -186,7 +237,7 @@ pub fn register_host_fns(linker: &mut Linker<HostState>) -> Result<(), anyhow::E
 /// Register Tier 1 extra host functions (storage, network, DHT).
 /// These are stubs — real implementations will integrate with CraftOBJ/CraftNET.
 pub fn register_tier1_host_fns(linker: &mut Linker<HostState>) -> Result<(), anyhow::Error> {
-    // storage_put(data_ptr, data_len) -> i32 (CID length or -1)
+    // storage_put(data_ptr, data_len) -> i32 (CID length written to shared_buffer, or -1)
     linker.func_wrap(
         "env",
         "storage_put",
@@ -199,24 +250,76 @@ pub fn register_tier1_host_fns(linker: &mut Linker<HostState>) -> Result<(), any
                 None => return -1,
             };
             let data = memory.data(&caller);
-            let bytes = &data[data_ptr as usize..(data_ptr + data_len) as usize];
-            let hash = blake3::hash(bytes);
-            let cid = hash.to_hex().to_string();
-            tracing::debug!(cid = %cid, size = data_len, "storage_put");
-            cid.len() as i32
+            let bytes = data[data_ptr as usize..(data_ptr + data_len) as usize].to_vec();
+
+            let store = match caller.data().store.clone() {
+                Some(s) => s,
+                None => {
+                    // No store configured — hash-only fallback (no persistence)
+                    let hash = blake3::hash(&bytes);
+                    let cid = hash.to_hex().to_string();
+                    let cid_bytes = cid.as_bytes();
+                    let buf = &mut caller.data_mut().shared_buffer;
+                    let len = cid_bytes.len().min(buf.len());
+                    buf[..len].copy_from_slice(&cid_bytes[..len]);
+                    tracing::debug!(cid = %cid, size = data_len, "storage_put (no store)");
+                    return len as i32;
+                }
+            };
+
+            match store.put(&bytes) {
+                Ok(cid) => {
+                    let cid_bytes = cid.as_bytes();
+                    let buf = &mut caller.data_mut().shared_buffer;
+                    let len = cid_bytes.len().min(buf.len());
+                    buf[..len].copy_from_slice(&cid_bytes[..len]);
+                    tracing::debug!(cid = %cid, size = data_len, "storage_put");
+                    len as i32
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "storage_put failed");
+                    -1
+                }
+            }
         },
     )?;
 
-    // storage_get(cid_ptr, cid_len) -> i32 (data length or -1)
+    // storage_get(cid_ptr, cid_len) -> i32 (data length written to shared_buffer, or -1)
     linker.func_wrap(
         "env",
         "storage_get",
-        |caller: Caller<'_, HostState>, _cid_ptr: i32, _cid_len: i32| -> i32 {
+        |mut caller: Caller<'_, HostState>, cid_ptr: i32, cid_len: i32| -> i32 {
             if caller.data().permissions.check(Capability::StorageRead).is_err() {
                 return -1;
             }
-            // Stub: would fetch from CraftOBJ
-            -1
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -1,
+            };
+            let data = memory.data(&caller);
+            let cid = match std::str::from_utf8(&data[cid_ptr as usize..(cid_ptr + cid_len) as usize]) {
+                Ok(s) => s.to_string(),
+                Err(_) => return -1,
+            };
+
+            let store = match caller.data().store.clone() {
+                Some(s) => s,
+                None => return -1,
+            };
+
+            match store.get(&cid) {
+                Ok(bytes) => {
+                    let buf = &mut caller.data_mut().shared_buffer;
+                    let len = bytes.len().min(buf.len());
+                    buf[..len].copy_from_slice(&bytes[..len]);
+                    tracing::debug!(cid = %cid, size = len, "storage_get");
+                    len as i32
+                }
+                Err(e) => {
+                    tracing::debug!(cid = %cid, error = %e, "storage_get not found");
+                    -1
+                }
+            }
         },
     )?;
 
