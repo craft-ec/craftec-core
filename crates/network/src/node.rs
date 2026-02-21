@@ -20,8 +20,12 @@ pub type CraftSwarm = libp2p::Swarm<CraftBehaviour>;
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     /// Protocol prefix for Kademlia, Identify, etc.
-    /// E.g. `"tunnelcraft"` yields `/tunnelcraft/kad/1.0.0`.
+    /// E.g. `"craftnet"` yields `/craftnet/kad/1.0.0`.
     pub protocol_prefix: String,
+    /// Optional secondary protocol prefix for dual-Kademlia.
+    /// When set, a second Kademlia DHT with this prefix is added to the swarm.
+    /// E.g. primary = `"craftobj"`, secondary = `"craftnet"` → two DHTs on one swarm.
+    pub secondary_protocol_prefix: Option<String>,
     /// Addresses to listen on.
     pub listen_addrs: Vec<Multiaddr>,
     /// Bootstrap peers to connect to on startup.
@@ -35,6 +39,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             protocol_prefix: "craftec".to_string(),
+            secondary_protocol_prefix: None,
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".parse().expect("valid multiaddr")],
             bootstrap_peers: Vec::new(),
             enable_mdns: true,
@@ -66,6 +71,7 @@ pub async fn build_swarm(
     info!("Local peer ID: {}", local_peer_id);
 
     let protocol_prefix = config.protocol_prefix.clone();
+    let secondary_prefix = config.secondary_protocol_prefix.clone();
     let enable_mdns = config.enable_mdns;
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -80,7 +86,11 @@ pub async fn build_swarm(
         .map_err(|e| NetworkError::SwarmBuildError(e.to_string()))?
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = PeerId::from(key.public());
-            CraftBehaviour::build_with_options(&protocol_prefix, peer_id, key, relay_behaviour, enable_mdns)
+            if let Some(ref sec) = secondary_prefix {
+                CraftBehaviour::build_dual_kad(&protocol_prefix, sec, peer_id, key, relay_behaviour, enable_mdns)
+            } else {
+                CraftBehaviour::build_with_options(&protocol_prefix, peer_id, key, relay_behaviour, enable_mdns)
+            }
         })
         .map_err(|e| NetworkError::SwarmBuildError(format!("{:?}", e)))?
         .with_swarm_config(|c| {
@@ -119,6 +129,7 @@ mod tests {
     fn test_config_custom_prefix() {
         let config = NetworkConfig {
             protocol_prefix: "craftobj".to_string(),
+            secondary_protocol_prefix: None,
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/9100".parse().unwrap()],
             bootstrap_peers: Vec::new(),
             enable_mdns: true,

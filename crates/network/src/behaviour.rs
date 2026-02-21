@@ -2,7 +2,7 @@
 //!
 //! Combines Kademlia DHT, Identify, mDNS, Gossipsub, Rendezvous,
 //! Relay, DCUtR, AutoNAT, and persistent stream protocols.
-//! All protocol names are parameterized by a prefix (e.g., "tunnelcraft", "craftobj").
+//! All protocol names are parameterized by a prefix (e.g., "craftnet", "craftobj").
 
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, relay, rendezvous,
@@ -14,12 +14,19 @@ use std::time::Duration;
 /// Combined network behaviour for any Craftec service.
 ///
 /// Protocol names are configured via the `protocol_prefix` passed to [`CraftBehaviour::build`].
-/// For example, prefix `"tunnelcraft"` yields Kademlia protocol `/tunnelcraft/kad/1.0.0`.
+/// For example, prefix `"craftnet"` yields Kademlia protocol `/craftnet/kad/1.0.0`.
+///
+/// Dual-Kademlia support: when `kademlia_secondary` is enabled (via [`CraftBehaviour::build_dual_kad`]),
+/// two independent Kademlia DHT instances run on the same swarm with separate protocol IDs.
+/// This allows e.g. CraftOBJ (`/craftobj/kad/1.0.0`) and CraftNet (`/craftnet/kad/1.0.0`)
+/// to share peer connections while keeping DHT records isolated.
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "CraftBehaviourEvent")]
 pub struct CraftBehaviour {
-    /// Kademlia DHT for peer and content discovery
+    /// Primary Kademlia DHT for peer and content discovery
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    /// Secondary Kademlia DHT (optional, for dual-craft swarm)
+    pub kademlia_secondary: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
     /// Identify protocol for peer info exchange
     pub identify: identify::Behaviour,
     /// mDNS for local network discovery (disabled via Toggle when not needed)
@@ -44,6 +51,7 @@ pub struct CraftBehaviour {
 #[derive(Debug)]
 pub enum CraftBehaviourEvent {
     Kademlia(kad::Event),
+    KademliaSecondary(kad::Event),
     Identify(identify::Event),
     Mdns(mdns::Event),
     Gossipsub(gossipsub::Event),
@@ -141,22 +149,63 @@ impl CraftBehaviour {
         relay_client: relay::client::Behaviour,
         enable_mdns: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Kademlia
+        Self::build_full(protocol_prefix, None, local_peer_id, keypair, relay_client, enable_mdns)
+    }
+
+    /// Build with dual Kademlia DHTs (separate protocol IDs on one swarm).
+    ///
+    /// `primary_prefix` — Kademlia protocol for the primary DHT (e.g. `"craftobj"`).
+    /// `secondary_prefix` — Kademlia protocol for the secondary DHT (e.g. `"craftnet"`).
+    /// Both share the same identify, mDNS, gossipsub, relay, etc.
+    pub fn build_dual_kad(
+        primary_prefix: &str,
+        secondary_prefix: &str,
+        local_peer_id: PeerId,
+        keypair: &libp2p::identity::Keypair,
+        relay_client: relay::client::Behaviour,
+        enable_mdns: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build_full(primary_prefix, Some(secondary_prefix), local_peer_id, keypair, relay_client, enable_mdns)
+    }
+
+    fn build_full(
+        protocol_prefix: &str,
+        secondary_prefix: Option<&str>,
+        local_peer_id: PeerId,
+        keypair: &libp2p::identity::Keypair,
+        relay_client: relay::client::Behaviour,
+        enable_mdns: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Primary Kademlia
         let kad_protocol = StreamProtocol::try_from_owned(
             format!("/{}/kad/1.0.0", protocol_prefix),
         )?;
         let mut kad_config = kad::Config::new(kad_protocol);
         kad_config.set_query_timeout(Duration::from_secs(60));
-        // Default Kademlia max_packet_size is 16KB — too small for manifests
-        // of large content (100MB → ~62KB manifest). Increase to 512KB.
         kad_config.set_max_packet_size(512 * 1024);
-        // Increase record limits: manifests can be ~60KB+ for large content,
-        // and verification records add more. Default 65KB is too tight.
         let mut store_config = kad::store::MemoryStoreConfig::default();
-        store_config.max_value_bytes = 256 * 1024; // 256KB per record
+        store_config.max_value_bytes = 256 * 1024;
         store_config.max_records = 4096;
         let store = kad::store::MemoryStore::with_config(local_peer_id, store_config);
         let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+
+        // Secondary Kademlia (optional)
+        let kademlia_secondary = if let Some(sec_prefix) = secondary_prefix {
+            let kad2_protocol = StreamProtocol::try_from_owned(
+                format!("/{}/kad/1.0.0", sec_prefix),
+            )?;
+            let mut kad2_config = kad::Config::new(kad2_protocol);
+            kad2_config.set_query_timeout(Duration::from_secs(60));
+            let store2 = kad::store::MemoryStore::new(local_peer_id);
+            let mut kad2 = kad::Behaviour::with_config(local_peer_id, store2, kad2_config);
+            // Server mode: respond to DHT queries from other peers.
+            // Without this, Kademlia acts as Client-only and won't respond
+            // to FIND_NODE / GET_PROVIDERS, leaving routing tables empty.
+            kad2.set_mode(Some(kad::Mode::Server));
+            Toggle::from(Some(kad2))
+        } else {
+            Toggle::from(None)
+        };
 
         // Identify
         let identify_config = identify::Config::new(
@@ -222,6 +271,7 @@ impl CraftBehaviour {
 
         Ok(Self {
             kademlia,
+            kademlia_secondary,
             identify,
             mdns,
             gossipsub,
@@ -309,14 +359,92 @@ impl CraftBehaviour {
     // Peer / Kademlia routing
     // =========================================================================
 
-    /// Add a known peer address to the Kademlia routing table.
+    /// Add a known peer address to both Kademlia routing tables.
     pub fn add_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
-        self.kademlia.add_address(peer_id, addr);
+        self.kademlia.add_address(peer_id, addr.clone());
+        if let Some(ref mut kad2) = self.kademlia_secondary.as_mut() {
+            kad2.add_address(peer_id, addr);
+        }
     }
 
-    /// Bootstrap the Kademlia DHT.
+    /// Bootstrap the primary Kademlia DHT.
     pub fn bootstrap(&mut self) -> Result<kad::QueryId, kad::NoKnownPeers> {
         self.kademlia.bootstrap()
+    }
+
+    /// Bootstrap the secondary Kademlia DHT (if enabled).
+    pub fn bootstrap_secondary(&mut self) -> Option<Result<kad::QueryId, kad::NoKnownPeers>> {
+        self.kademlia_secondary.as_mut().map(|kad2| kad2.bootstrap())
+    }
+
+    // =========================================================================
+    // Secondary Kademlia DHT methods
+    // =========================================================================
+
+    /// Get a mutable reference to the secondary Kademlia DHT (if enabled).
+    pub fn kademlia_secondary_mut(&mut self) -> Option<&mut kad::Behaviour<kad::store::MemoryStore>> {
+        self.kademlia_secondary.as_mut()
+    }
+
+    /// Get an immutable reference to the secondary Kademlia DHT (if enabled).
+    pub fn kademlia_secondary_ref(&self) -> Option<&kad::Behaviour<kad::store::MemoryStore>> {
+        self.kademlia_secondary.as_ref()
+    }
+
+    /// Store a record in the secondary DHT.
+    pub fn put_record_secondary(
+        &mut self,
+        key: &[u8],
+        value: Vec<u8>,
+        publisher: &PeerId,
+        ttl: Option<Duration>,
+    ) -> Option<Result<kad::QueryId, kad::store::Error>> {
+        self.kademlia_secondary.as_mut().map(|kad2| {
+            let record = kad::Record {
+                key: kad::RecordKey::new(&key),
+                value,
+                publisher: Some(*publisher),
+                expires: ttl.map(|d| std::time::Instant::now() + d),
+            };
+            kad2.put_record(record, kad::Quorum::One)
+        })
+    }
+
+    /// Retrieve a record from the secondary DHT.
+    pub fn get_record_secondary(&mut self, key: &[u8]) -> Option<kad::QueryId> {
+        self.kademlia_secondary.as_mut().map(|kad2| {
+            let key = kad::RecordKey::new(&key);
+            kad2.get_record(key)
+        })
+    }
+
+    /// Announce as provider in the secondary DHT.
+    pub fn start_providing_secondary(&mut self, key: &[u8]) -> Option<Result<kad::QueryId, kad::store::Error>> {
+        self.kademlia_secondary.as_mut().map(|kad2| {
+            let key = kad::RecordKey::new(&key);
+            kad2.start_providing(key)
+        })
+    }
+
+    /// Stop providing in the secondary DHT.
+    pub fn stop_providing_secondary(&mut self, key: &[u8]) {
+        if let Some(kad2) = self.kademlia_secondary.as_mut() {
+            let key = kad::RecordKey::new(&key);
+            kad2.stop_providing(&key);
+        }
+    }
+
+    /// Query providers in the secondary DHT.
+    pub fn get_providers_secondary(&mut self, key: &[u8]) -> Option<kad::QueryId> {
+        self.kademlia_secondary.as_mut().map(|kad2| {
+            let key = kad::RecordKey::new(&key);
+            kad2.get_providers(key)
+        })
+    }
+
+    /// Whether the secondary Kademlia DHT is enabled.
+    pub fn has_secondary_kad(&self) -> bool {
+        self.kademlia_secondary.is_enabled()
     }
 
     // =========================================================================

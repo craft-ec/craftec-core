@@ -45,7 +45,7 @@ pub fn make_bootstrap_addr(ip: &str, port: u16, peer_id: &str) -> String {
 
 /// Returns the default bootstrap nodes for craftec-core (empty).
 ///
-/// Each craft (tunnelcraft, craftobj, etc.) provides its own bootstrap list.
+/// Each craft (craftnet, craftobj, etc.) provides its own bootstrap list.
 pub fn default_bootstrap_nodes() -> &'static [&'static str] {
     &[]
 }
