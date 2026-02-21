@@ -1,6 +1,6 @@
 //! Receipt collector: validates, deduplicates, and queues StorageReceipts by pool.
 //!
-//! Supports ingestion from gossipsub via a channel-based listener.
+//! Supports ingestion from storage nodes via a channel-based listener (P2P direct push).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,9 +12,9 @@ use tracing::{debug, info, warn};
 
 use crate::AggregatorError;
 
-/// A receipt message received from gossipsub (bincode-serialized StorageReceipt).
+/// A receipt message received via direct P2P push (bincode-serialized StorageReceipt).
 #[derive(Debug, Clone)]
-pub struct GossipReceiptMessage {
+pub struct ReceiptMessage {
     /// Raw bincode-serialized StorageReceipt.
     pub data: Vec<u8>,
 }
@@ -81,8 +81,8 @@ impl ReceiptCollector {
         self.pool_receipts.remove(pool).unwrap_or_default()
     }
 
-    /// Process a raw gossipsub message: deserialize and ingest.
-    pub fn process_gossip_message(&mut self, data: &[u8]) -> Result<(), AggregatorError> {
+    /// Process a raw receipt message (bincode-serialized): deserialize and ingest.
+    pub fn process_receipt_message(&mut self, data: &[u8]) -> Result<(), AggregatorError> {
         let receipt: StorageReceipt = bincode::deserialize(data)
             .map_err(|e| AggregatorError::Serialization(e.to_string()))?;
         self.ingest(receipt)
@@ -92,14 +92,14 @@ impl ReceiptCollector {
     /// Returns the number of successfully ingested receipts.
     pub fn drain_channel(
         &mut self,
-        rx: &mut mpsc::Receiver<GossipReceiptMessage>,
+        rx: &mut mpsc::Receiver<ReceiptMessage>,
     ) -> usize {
         let mut count = 0;
         while let Ok(msg) = rx.try_recv() {
-            match self.process_gossip_message(&msg.data) {
+            match self.process_receipt_message(&msg.data) {
                 Ok(()) => count += 1,
                 Err(e) => {
-                    debug!(error = %e, "rejected gossip receipt");
+                    debug!(error = %e, "rejected receipt");
                 }
             }
         }

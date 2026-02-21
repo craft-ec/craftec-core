@@ -23,6 +23,12 @@ impl Identity {
         Self { did, keypair }
     }
 
+    /// Create an identity from raw 32-byte ed25519 secret key bytes.
+    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+        let keypair = SigningKey::from_bytes(secret);
+        Self::from_keypair(keypair)
+    }
+
     /// Sign data with this identity's private key.
     pub fn sign(&self, data: &[u8]) -> Signature {
         self.keypair.sign(data)

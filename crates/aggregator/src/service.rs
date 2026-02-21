@@ -1,6 +1,6 @@
 //! Top-level aggregator service with epoch loop.
 //!
-//! Integrates gossipsub receipt collection, batch building, proof generation,
+//! Integrates P2P receipt collection, batch building, proof generation,
 //! and on-chain distribution posting.
 
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::batch::BatchBuilder;
-use crate::collector::{GossipReceiptMessage, ReceiptCollector};
+use crate::collector::{ReceiptMessage, ReceiptCollector};
 use crate::poster::{BuiltTransaction, DistributionPoster, TransactionSubmitter};
 use crate::AggregatorError;
 
@@ -50,7 +50,7 @@ impl Default for AggregatorConfig {
 }
 
 /// The main aggregator service. Runs an epoch loop that:
-/// 1. Collects receipts during the epoch window (from gossipsub channel)
+/// 1. Collects receipts during the epoch window (from P2P receipt push channel)
 /// 2. At epoch boundary, builds batches and generates proofs
 /// 3. Posts distributions on-chain via the submitter
 pub struct AggregatorService {
@@ -181,14 +181,14 @@ impl AggregatorService {
         info!(epoch = self.current_epoch, "advanced to new epoch");
     }
 
-    /// Run the epoch loop with a gossipsub receipt channel and a transaction submitter.
+    /// Run the epoch loop with a P2P receipt channel and a transaction submitter.
     ///
     /// This is the main entry point for production use. Receipts arrive via
-    /// the `receipt_rx` channel (fed by a gossipsub listener), and built
-    /// transactions are submitted via the `submitter`.
+    /// the `receipt_rx` channel (fed by a P2P listener on `/craftobj/transfer/3.0.0`),
+    /// and built transactions are submitted via the `submitter`.
     pub async fn run_with_channel(
         &mut self,
-        mut receipt_rx: mpsc::Receiver<GossipReceiptMessage>,
+        mut receipt_rx: mpsc::Receiver<ReceiptMessage>,
         submitter: Arc<dyn TransactionSubmitter>,
     ) {
         info!(

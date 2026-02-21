@@ -39,7 +39,7 @@ Products:
   CraftOBJ — distributed object storage
   CraftSQL — SQLite VFS on CraftOBJ
   CraftVFS — distributed filesystem on CraftSQL
-  CraftNET — decentralized VPN (formerly TunnelCraft)
+  CraftNET — decentralized VPN (formerly CraftNet)
   CraftSEC — on-demand MPC functions (transaction attestation)
   CraftCPU — persistent CPU agents (gateway, bots, services)
   CraftGPU — persistent GPU agents (inference, ZK, media)

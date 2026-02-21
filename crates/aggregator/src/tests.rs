@@ -9,7 +9,7 @@ mod tests {
     use craftec_settlement::StorageReceipt;
 
     use crate::batch::BatchBuilder;
-    use crate::collector::{GossipReceiptMessage, ReceiptCollector};
+    use crate::collector::{ReceiptCollector, ReceiptMessage};
     use crate::poster::{DistributionPoster, DryRunSubmitter};
     use crate::service::{AggregatorConfig, AggregatorService};
 
@@ -255,7 +255,7 @@ mod tests {
         let receipt = make_receipt(&challenger, storage_node, content_id, 0, 1500);
         let data = bincode::serialize(&receipt).unwrap();
 
-        assert!(collector.process_gossip_message(&data).is_ok());
+        assert!(collector.process_receipt_message(&data).is_ok());
         assert_eq!(collector.receipt_count(), 1);
     }
 
@@ -263,7 +263,7 @@ mod tests {
     fn test_collector_rejects_invalid_gossip_message() {
         let mut collector = ReceiptCollector::new(1000, 2000, 300);
         let bad_data = vec![0u8; 10]; // not a valid receipt
-        assert!(collector.process_gossip_message(&bad_data).is_err());
+        assert!(collector.process_receipt_message(&bad_data).is_err());
     }
 
     #[tokio::test]
@@ -276,13 +276,13 @@ mod tests {
         let mut collector = ReceiptCollector::new(1000, 2000, 300);
         collector.register_pool(content_id, pool);
 
-        let (tx, mut rx) = mpsc::channel::<GossipReceiptMessage>(100);
+        let (tx, mut rx) = mpsc::channel::<ReceiptMessage>(100);
 
         // Send 3 receipts via channel
         for i in 0..3u32 {
             let receipt = make_receipt(&challenger, storage_node, content_id, i, 1500 + i as u64);
             let data = bincode::serialize(&receipt).unwrap();
-            tx.send(GossipReceiptMessage { data }).await.unwrap();
+            tx.send(ReceiptMessage { data }).await.unwrap();
         }
 
         let ingested = collector.drain_channel(&mut rx);
@@ -338,7 +338,7 @@ mod tests {
         service.collector_mut().register_pool(content_id, pool);
 
         // Create channel and feed receipts (simulating gossipsub)
-        let (tx, mut rx) = mpsc::channel::<GossipReceiptMessage>(100);
+        let (tx, mut rx) = mpsc::channel::<ReceiptMessage>(100);
 
         let receipts_data: Vec<_> = vec![
             make_receipt(&challenger, node_a, content_id, 0, 1500),
@@ -350,7 +350,7 @@ mod tests {
         .collect();
 
         for data in receipts_data {
-            tx.send(GossipReceiptMessage { data }).await.unwrap();
+            tx.send(ReceiptMessage { data }).await.unwrap();
         }
 
         // Drain receipts from channel

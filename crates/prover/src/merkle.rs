@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 /// Compute the Merkle root of a list of leaf hashes.
 ///
 /// Pads to next power-of-2 with `[0u8; 32]`, then bottom-up `SHA256(left || right)`.
-/// Matches the guest program and TunnelCraft's Merkle tree algorithm.
+/// Matches the guest program and CraftNet's Merkle tree algorithm.
 pub fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
         return [0u8; 32];

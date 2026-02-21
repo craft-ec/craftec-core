@@ -1,6 +1,6 @@
 //! Craftec Aggregator Service
 //!
-//! Collects `StorageReceipt`s from storage nodes via gossipsub, batches them
+//! Collects `StorageReceipt`s from storage nodes via direct P2P push, batches them
 //! per creator pool per epoch, generates ZK proofs via `craftec-prover`, and
 //! posts distributions on-chain via `craftec-settlement` instruction builders.
 
@@ -11,7 +11,7 @@ pub mod service;
 #[cfg(test)]
 mod tests;
 
-pub use collector::{GossipReceiptMessage, ReceiptCollector};
+pub use collector::{ReceiptMessage, ReceiptCollector};
 pub use batch::BatchBuilder;
 pub use poster::{BuiltTransaction, DistributionPoster, DryRunSubmitter, SolanaRpcPoster, SubmitResult, TransactionSubmitter};
 pub use service::{AggregatorConfig, AggregatorService};
