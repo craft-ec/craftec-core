@@ -29,9 +29,24 @@ impl Identity {
         Self::from_keypair(keypair)
     }
 
+    /// Return the 32-byte ed25519 public key.
+    pub fn pubkey(&self) -> [u8; 32] {
+        self.keypair.verifying_key().to_bytes()
+    }
+
+    /// Return the 32-byte ed25519 secret key bytes (for keystore persistence).
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.keypair.to_bytes()
+    }
+
     /// Sign data with this identity's private key.
     pub fn sign(&self, data: &[u8]) -> Signature {
         self.keypair.sign(data)
+    }
+
+    /// Sign data and return the signature as a 64-byte array.
+    pub fn sign_bytes(&self, data: &[u8]) -> [u8; 64] {
+        self.sign(data).to_bytes()
     }
 
     /// Verify a signature against a public key.
@@ -40,6 +55,18 @@ impl Identity {
             return false;
         };
         verifying_key.verify(data, signature).is_ok()
+    }
+
+    /// Verify a signature against a public key given as raw 64-byte signature bytes.
+    pub fn verify_bytes(pubkey: &[u8; 32], data: &[u8], signature_bytes: &[u8; 64]) -> bool {
+        let signature = Signature::from_bytes(signature_bytes);
+        Self::verify(pubkey, data, &signature)
+    }
+
+    /// Verify a signature using a DID (extracts the public key from the DID).
+    pub fn verify_with_did(did: &crate::Did, data: &[u8], signature: &Signature) -> bool {
+        let pubkey = did.to_pubkey();
+        Self::verify(&pubkey, data, signature)
     }
 }
 
@@ -63,5 +90,33 @@ mod tests {
         let pubkey = key.verifying_key().to_bytes();
         let id = Identity::from_keypair(key);
         assert_eq!(id.did.to_pubkey(), pubkey);
+    }
+
+    #[test]
+    fn pubkey_and_secret_roundtrip() {
+        let id = Identity::generate();
+        let pubkey = id.pubkey();
+        let secret = id.secret_bytes();
+        assert_eq!(pubkey, id.did.to_pubkey());
+        let restored = Identity::from_secret_bytes(&secret);
+        assert_eq!(restored.pubkey(), pubkey);
+        assert_eq!(restored.did, id.did);
+    }
+
+    #[test]
+    fn sign_bytes_and_verify_bytes() {
+        let id = Identity::generate();
+        let data = b"test message";
+        let sig_bytes = id.sign_bytes(data);
+        assert!(Identity::verify_bytes(&id.pubkey(), data, &sig_bytes));
+        assert!(!Identity::verify_bytes(&id.pubkey(), b"wrong", &sig_bytes));
+    }
+
+    #[test]
+    fn verify_with_did() {
+        let id = Identity::generate();
+        let data = b"verify via did";
+        let sig = id.sign(data);
+        assert!(Identity::verify_with_did(&id.did, data, &sig));
     }
 }
